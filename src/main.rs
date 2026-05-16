@@ -75,7 +75,9 @@ fn build_learned_err_params(
         errfun_cmd,
         max_consist,
         omega_a: dp.omega_a,
-        omega_c: dp.omega_c,
+        // Deliberately not embedded: learn-time `omega_c` (R default 0)
+        // differs from dada-time (R default 1e-40) and must not transfer.
+        omega_c: None,
         omega_p: dp.omega_p,
         min_fold: dp.min_fold,
         min_hamming: dp.min_hamming,
@@ -398,7 +400,9 @@ fn main() -> io::Result<()> {
                 }};
             }
             let omega_a = resolve!(omega_a, omega_a, 1e-40);
-            let omega_c = resolve!(omega_c, omega_c, 1e-40);
+            // `omega_c` is intentionally not inherited from the err model:
+            // learn-errors uses 0 (R DADA2 convention), dada uses 1e-40.
+            let omega_c = omega_c.unwrap_or(1e-40);
             let omega_p = resolve!(omega_p, omega_p, 1e-4);
             let min_fold = resolve!(min_fold, min_fold, 1.0);
             let min_hamming = resolve!(min_hamming, min_hamming, 1);
@@ -468,7 +472,9 @@ fn main() -> io::Result<()> {
                         };
                     }
                     check!("omega_a", omega_a, em_params.omega_a);
-                    check!("omega_c", omega_c, em_params.omega_c);
+                    // omega_c is intentionally not embedded by learn-errors
+                    // (learn-time and dada-time defaults differ in R DADA2),
+                    // so we don't compare against the err model here.
                     check!("omega_p", omega_p, em_params.omega_p);
                     check!("min_fold", min_fold, em_params.min_fold);
                     check!("min_hamming", min_hamming, em_params.min_hamming);
@@ -912,7 +918,9 @@ fn main() -> io::Result<()> {
                 }};
             }
             let omega_a = resolve!(omega_a, omega_a, 1e-40);
-            let omega_c = resolve!(omega_c, omega_c, 1e-40);
+            // `omega_c` is intentionally not inherited from the err model:
+            // learn-errors uses 0 (R DADA2 convention), dada uses 1e-40.
+            let omega_c = omega_c.unwrap_or(1e-40);
             let omega_p = resolve!(omega_p, omega_p, 1e-4);
             let min_fold = resolve!(min_fold, min_fold, 1.0);
             let min_hamming = resolve!(min_hamming, min_hamming, 1);

@@ -152,8 +152,13 @@ pub struct LearnedErrParams {
     // ---- DadaParams: significance / fold thresholds ----
     #[serde(default)]
     pub omega_a: f64,
-    #[serde(default)]
-    pub omega_c: f64,
+    /// `omega_c` is `None` in JSONs produced by `learn-errors` /
+    /// `errors-from-sample`: R DADA2 hard-codes `OMEGA_C=0` during error
+    /// learning but uses `1e-40` for standalone `dada()`, so the learn-time
+    /// value is deliberately not transferred. dada / dada-pooled ignore any
+    /// inherited value here and use CLI-or-default instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub omega_c: Option<f64>,
     #[serde(default)]
     pub omega_p: f64,
     #[serde(default)]
