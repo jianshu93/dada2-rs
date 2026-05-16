@@ -936,8 +936,12 @@ pub enum Commands {
         #[arg(long, default_value = "1e-40")]
         omega_a: f64,
 
-        /// Significance threshold for omega_c (reads not corrected to any center)
-        #[arg(long, default_value = "1e-40")]
+        /// Significance threshold for omega_c (reads not corrected to any center).
+        /// Defaults to 0, matching R DADA2's `learnErrors()` (which hard-codes
+        /// OMEGA_C=0 in its internal dada() calls, overriding the standard
+        /// `dada()` default of 1e-40). Pass `--omega-c 1e-40` to use the
+        /// standard `dada()` value instead.
+        #[arg(long, default_value = "0")]
         omega_c: f64,
 
         /// Significance threshold for prior-sequence splitting (omega_p)
@@ -1102,8 +1106,12 @@ pub enum Commands {
         #[arg(long, default_value = "1e-40")]
         omega_a: f64,
 
-        /// Significance threshold for omega_c (reads not corrected to any center)
-        #[arg(long, default_value = "1e-40")]
+        /// Significance threshold for omega_c (reads not corrected to any center).
+        /// Defaults to 0, matching R DADA2's `learnErrors()` (which hard-codes
+        /// OMEGA_C=0 in its internal dada() calls, overriding the standard
+        /// `dada()` default of 1e-40). Pass `--omega-c 1e-40` to use the
+        /// standard `dada()` value instead.
+        #[arg(long, default_value = "0")]
         omega_c: f64,
 
         /// Significance threshold for prior-sequence splitting (omega_p)
