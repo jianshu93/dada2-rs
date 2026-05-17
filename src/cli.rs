@@ -906,14 +906,20 @@ pub enum Commands {
         ///
         /// Allowed values: loess (default), noqual, binned-qual, pacbio, external.
         ///
-        /// Note on `loess` vs R DADA2: the native Rust loess uses a
-        /// normal-equations solve which diverges from R's `stats::loess`
-        /// (QR with orthogonal polynomials) by up to ~1e-3 absolute at the
-        /// low-quality edges where the local design matrix is poorly
-        /// conditioned. Downstream ASV impact is minimal in practice.
-        /// For bit-for-bit R parity, use:
+        /// Note on `loess` vs R DADA2: the native Rust loess is
+        /// algorithmically equivalent to R's `loess(surface = "direct")` —
+        /// bit-exact to machine precision on real data (validated against
+        /// `examples/external_errfun/loess_reference_direct.R`). R DADA2's
+        /// `loessErrfun`, however, calls `loess(...)` with R's default
+        /// `surface = "interpolate"`, which fits the local polynomial at
+        /// kd-tree vertices and interpolates between them. The two surfaces
+        /// disagree by ~1e-3 absolute / ~4% relative at low-Q edges; the
+        /// downstream ASV impact on dada2 inference is minimal (~1 read per
+        /// sample on a 362-sample benchmark).
+        ///
+        /// For bit-for-bit parity with R DADA2's `loessErrfun`, use:
         ///   --errfun external --errfun-cmd "Rscript examples/external_errfun/loess_reference.R"
-        /// See issue #14 for the tracking discussion.
+        /// See issue #14 for the full decomposition.
         #[arg(long, default_value = "loess")]
         errfun: String,
 
@@ -1085,14 +1091,20 @@ pub enum Commands {
         ///
         /// Allowed values: loess (default), noqual, binned-qual, pacbio, external.
         ///
-        /// Note on `loess` vs R DADA2: the native Rust loess uses a
-        /// normal-equations solve which diverges from R's `stats::loess`
-        /// (QR with orthogonal polynomials) by up to ~1e-3 absolute at the
-        /// low-quality edges where the local design matrix is poorly
-        /// conditioned. Downstream ASV impact is minimal in practice.
-        /// For bit-for-bit R parity, use:
+        /// Note on `loess` vs R DADA2: the native Rust loess is
+        /// algorithmically equivalent to R's `loess(surface = "direct")` —
+        /// bit-exact to machine precision on real data (validated against
+        /// `examples/external_errfun/loess_reference_direct.R`). R DADA2's
+        /// `loessErrfun`, however, calls `loess(...)` with R's default
+        /// `surface = "interpolate"`, which fits the local polynomial at
+        /// kd-tree vertices and interpolates between them. The two surfaces
+        /// disagree by ~1e-3 absolute / ~4% relative at low-Q edges; the
+        /// downstream ASV impact on dada2 inference is minimal (~1 read per
+        /// sample on a 362-sample benchmark).
+        ///
+        /// For bit-for-bit parity with R DADA2's `loessErrfun`, use:
         ///   --errfun external --errfun-cmd "Rscript examples/external_errfun/loess_reference.R"
-        /// See issue #14 for the tracking discussion.
+        /// See issue #14 for the full decomposition.
         #[arg(long, default_value = "loess")]
         errfun: String,
 
