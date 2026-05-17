@@ -52,16 +52,6 @@ pub struct LearnDiagOptions<'a> {
 const MIN_ERR: f64 = 1e-7;
 #[allow(dead_code)]
 const MAX_ERR: f64 = 0.25;
-/// Maximum difference between consecutive error-model iterations considered converged.
-const CONVERGENCE_TOL: f64 = 1e-7;
-/// Bail with a "stalled" stop reason if `max_delta` fails to set a new
-/// best-so-far for this many consecutive iterations. Catches the oscillation
-/// pattern where err_out cycles between a few values without settling — most
-/// commonly seen with too-loose k-mer screening (e.g. k=4 on Illumina).
-const STALL_PATIENCE: usize = 3;
-/// Relative improvement required to count as a new best-so-far. Without
-/// this floor, tiny floating-point drifts would forever look like progress.
-const STALL_REL_IMPROVE: f64 = 0.99;
 
 // ---------------------------------------------------------------------------
 // Error function selection
@@ -201,12 +191,10 @@ pub struct LearnedErrParams {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StopReason {
-    /// `max_delta < CONVERGENCE_TOL`: the model is stable.
+    /// New err matrix bit-exactly matched a prior iteration's input —
+    /// either a fixed point or a longer cycle. Mirrors R DADA2.
     Converged,
-    /// `max_delta` stopped improving for `STALL_PATIENCE` iterations.
-    /// Typically signals oscillation (e.g. too-loose k-mer screening).
-    Stalled,
-    /// Reached `max_consist` without converging or stalling.
+    /// Reached `max_consist` without finding a bit-exact match.
     MaxConsistReached,
 }
 
@@ -654,11 +642,16 @@ pub fn learn_errors(
     let mut err_in_final = err.clone();
     let mut err_out_final = err.clone();
     let mut stop_reason = StopReason::MaxConsistReached;
-    let mut best_max_delta = f64::INFINITY;
-    let mut iters_since_best = 0usize;
+    // History of err matrices used as input to dada in this loop. Mirrors R
+    // DADA2's `errs` list (dada.R:264, :391): after estimating each iteration's
+    // new_err we check whether it bit-exactly matches any prior input — that
+    // catches both fixed points (cycle length 1) and longer cycles natively,
+    // replacing the previous tolerance-based check and stall detector.
+    let mut err_history: Vec<Vec<f64>> = Vec::with_capacity(max_consist);
 
     for iter in 0..max_consist {
         iterations = iter + 1;
+        err_history.push(err.clone());
 
         // ---- Run DADA on each sample ----
         // Set the error matrix once per iteration (shared across all samples).
@@ -788,14 +781,17 @@ pub fn learn_errors(
             .apply(&acc_trans, nq)
             .map_err(|e| io::Error::other(format!("errfun failed: {e}")))?;
 
-        // ---- Check convergence ----
+        // max_delta is kept for diagnostics only; convergence is decided by
+        // bit-exact membership in `err_history` (see below).
         let max_delta = err
             .iter()
             .zip(new_err.iter())
             .map(|(&a, &b)| (a - b).abs())
             .fold(0.0f64, f64::max);
 
-        let iter_converged = max_delta < CONVERGENCE_TOL;
+        // ---- Check convergence: bit-exact match against any prior input ----
+        // Mirrors R's `any(sapply(errs, identical, err))` (dada.R:391).
+        let iter_converged = err_history.iter().any(|prev| prev == &new_err);
 
         if verbose {
             eprintln!(
@@ -832,32 +828,6 @@ pub fn learn_errors(
                 eprintln!("[learn_errors] converged after {} iteration(s)", iter + 1);
             }
             break;
-        }
-
-        // ---- Stall detection: bail if max_delta hasn't set a new
-        // best-so-far for STALL_PATIENCE consecutive iterations.  This
-        // catches oscillation (e.g. k-mer screen too loose → err_out
-        // cycles between a small set of values). Without this we'd run
-        // through max_consist iterations producing identical-cluster
-        // but slightly-different err_out tables. ----
-        if max_delta < best_max_delta * STALL_REL_IMPROVE {
-            best_max_delta = max_delta;
-            iters_since_best = 0;
-        } else {
-            iters_since_best += 1;
-            if iters_since_best >= STALL_PATIENCE {
-                stop_reason = StopReason::Stalled;
-                if verbose {
-                    eprintln!(
-                        "[learn_errors] stalled at iter {}: max_delta has not improved \
-                         on best-so-far ({:.2e}) for {} iteration(s); stopping early",
-                        iter + 1,
-                        best_max_delta,
-                        STALL_PATIENCE,
-                    );
-                }
-                break;
-            }
         }
 
         err = new_err;
