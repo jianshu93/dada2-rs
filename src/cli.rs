@@ -943,6 +943,26 @@ pub enum Commands {
         #[arg(long)]
         errfun_cmd: Option<String>,
 
+        /// LOESS fitting surface (only used with --errfun loess).
+        ///
+        /// `direct` (default) evaluates the local polynomial at every query
+        /// point. Matches R `loess(surface = "direct")` to machine precision.
+        ///
+        /// `interpolate` builds a 1-D kd-tree partition, fits the local
+        /// polynomial at each vertex, and blends adjacent vertex polynomials
+        /// with a cubic smoothstep at query points.  Matches R's default
+        /// `loess(surface = "interpolate")` — the variant R DADA2's
+        /// `loessErrfun` uses.
+        #[arg(long, default_value = "direct",
+              value_parser = ["direct", "interpolate"])]
+        loess_surface: String,
+
+        /// Maximum fraction of observations allowed per kd-tree cell before
+        /// it is subdivided.  Only used with --loess-surface interpolate.
+        /// Mirrors R `loess.control(cell = ...)`; R's default is 0.2.
+        #[arg(long, default_value_t = 0.2)]
+        loess_cell: f64,
+
         /// Maximum self-consistency iterations (mirrors R's MAX_CONSIST)
         #[arg(long, default_value_t = 10)]
         max_consist: usize,
@@ -1127,6 +1147,26 @@ pub enum Commands {
         /// layout. See examples/external_errfun/ for reference scripts.
         #[arg(long)]
         errfun_cmd: Option<String>,
+
+        /// LOESS fitting surface (only used with --errfun loess).
+        ///
+        /// `direct` (default) evaluates the local polynomial at every query
+        /// point. Matches R `loess(surface = "direct")` to machine precision.
+        ///
+        /// `interpolate` builds a 1-D kd-tree partition, fits the local
+        /// polynomial at each vertex, and blends adjacent vertex polynomials
+        /// with a cubic smoothstep at query points.  Matches R's default
+        /// `loess(surface = "interpolate")` — the variant R DADA2's
+        /// `loessErrfun` uses.
+        #[arg(long, default_value = "direct",
+              value_parser = ["direct", "interpolate"])]
+        loess_surface: String,
+
+        /// Maximum fraction of observations allowed per kd-tree cell before
+        /// it is subdivided.  Only used with --loess-surface interpolate.
+        /// Mirrors R `loess.control(cell = ...)`; R's default is 0.2.
+        #[arg(long, default_value_t = 0.2)]
+        loess_cell: f64,
 
         /// Maximum self-consistency iterations (mirrors R's MAX_CONSIST)
         #[arg(long, default_value_t = 10)]

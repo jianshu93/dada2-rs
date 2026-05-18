@@ -62,7 +62,7 @@ fn build_learned_err_params(
     ap: &AlignParams,
 ) -> LearnedErrParams {
     let (errfun_name, errfun_pseudocount, errfun_bins, errfun_cmd) = match errfun {
-        ErrFun::Loess => ("loess", None, None, None),
+        ErrFun::Loess { .. } => ("loess", None, None, None),
         ErrFun::Noqual { pseudocount } => ("noqual", Some(*pseudocount), None, None),
         ErrFun::BinnedQual { bins } => ("binned-qual", None, Some(bins.clone()), None),
         ErrFun::PacBio => ("pacbio", None, None, None),
@@ -1783,6 +1783,8 @@ fn main() -> io::Result<()> {
             pseudocount,
             binned_quals,
             errfun_cmd,
+            loess_surface,
+            loess_cell,
             max_consist,
             omega_a,
             omega_c,
@@ -1805,8 +1807,14 @@ fn main() -> io::Result<()> {
             trace_min_abund,
             verbose,
         } => {
+            let surface = match loess_surface.as_str() {
+                "interpolate" => {
+                    crate::error_models::LoessSurface::Interpolate { cell: loess_cell }
+                }
+                _ => crate::error_models::LoessSurface::Direct,
+            };
             let err_fun = match errfun.as_str() {
-                "loess" => ErrFun::Loess,
+                "loess" => ErrFun::Loess { surface },
                 "noqual" => ErrFun::Noqual { pseudocount },
                 "binned-qual" => {
                     let bins = binned_quals.ok_or_else(|| {
@@ -2415,6 +2423,8 @@ fn main() -> io::Result<()> {
             pseudocount,
             binned_quals,
             errfun_cmd,
+            loess_surface,
+            loess_cell,
             max_consist,
             omega_a,
             omega_c,
@@ -2437,8 +2447,14 @@ fn main() -> io::Result<()> {
             trace_min_abund,
             verbose,
         } => {
+            let surface = match loess_surface.as_str() {
+                "interpolate" => {
+                    crate::error_models::LoessSurface::Interpolate { cell: loess_cell }
+                }
+                _ => crate::error_models::LoessSurface::Direct,
+            };
             let err_fun = match errfun.as_str() {
-                "loess" => ErrFun::Loess,
+                "loess" => ErrFun::Loess { surface },
                 "noqual" => ErrFun::Noqual { pseudocount },
                 "binned-qual" => {
                     let bins = binned_quals.ok_or_else(|| {
