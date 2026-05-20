@@ -1067,7 +1067,8 @@ pub enum Commands {
         /// For bit-for-bit parity with R DADA2's `loessErrfun`, use:
         ///   --errfun external --errfun-cmd "Rscript examples/external_errfun/loess_reference.R"
         /// See issue #14 for the full decomposition.
-        #[arg(long, default_value = "loess")]
+        #[arg(long, default_value = "loess",
+              value_parser = ["loess", "noqual", "binned-qual", "pacbio", "external"])]
         errfun: String,
 
         /// Pseudocount added to each transition total (only used with --errfun noqual)
@@ -1297,7 +1298,8 @@ pub enum Commands {
         /// For bit-for-bit parity with R DADA2's `loessErrfun`, use:
         ///   --errfun external --errfun-cmd "Rscript examples/external_errfun/loess_reference.R"
         /// See issue #14 for the full decomposition.
-        #[arg(long, default_value = "loess")]
+        #[arg(long, default_value = "loess",
+              value_parser = ["loess", "noqual", "binned-qual", "pacbio", "external"])]
         errfun: String,
 
         /// Pseudocount added to each transition total (only used with --errfun noqual)
