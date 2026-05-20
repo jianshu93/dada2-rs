@@ -182,7 +182,7 @@ fn seq_complexity_2mer(seq: &[u8]) -> f64 {
 ///
 /// Returns `None` when the read should be discarded; otherwise returns
 /// `Some((trimmed_seq, trimmed_qual))`.
-fn filter_read(seq: &[u8], qual: &[u8], p: &FilterParams) -> Option<(Vec<u8>, Vec<u8>)> {
+pub fn filter_read(seq: &[u8], qual: &[u8], p: &FilterParams) -> Option<(Vec<u8>, Vec<u8>)> {
     // 1. maxLen (raw, before any trimming)
     if p.max_len > 0 && seq.len() > p.max_len {
         return None;

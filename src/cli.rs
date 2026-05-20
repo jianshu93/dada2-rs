@@ -523,6 +523,58 @@ pub enum Commands {
         #[arg(long, default_value_t = 1)]
         threads: usize,
 
+        /// Truncate reads at first Phred score ≤ this value (omit to disable).
+        /// Applied after primer trimming.
+        #[arg(long)]
+        trunc_q: Option<u8>,
+
+        /// Truncate reads to this many bases; discard if shorter (omit to disable).
+        /// Applied after primer trimming.
+        #[arg(long)]
+        trunc_len: Option<usize>,
+
+        /// Remove this many bases from the 5′ end of the primer-trimmed read.
+        #[arg(long)]
+        trim_left: Option<usize>,
+
+        /// Remove this many bases from the 3′ end of the primer-trimmed read.
+        #[arg(long)]
+        trim_right: Option<usize>,
+
+        /// Discard reads longer than this before quality trimming (omit = no limit).
+        #[arg(long)]
+        max_len: Option<usize>,
+
+        /// Discard reads shorter than this after all trimming (omit = no minimum).
+        #[arg(long)]
+        min_len: Option<usize>,
+
+        /// Discard reads with more than this many N bases.
+        #[arg(long)]
+        max_n: Option<usize>,
+
+        /// Discard reads with any Phred score below this value (omit to disable).
+        #[arg(long)]
+        min_q: Option<u8>,
+
+        /// Discard reads with expected errors above this threshold (omit to disable).
+        #[arg(long)]
+        max_ee: Option<f64>,
+
+        /// Path to a FASTA file containing the phiX genome; reads matching it are removed.
+        /// Omit to skip phiX filtering.
+        #[arg(long)]
+        phix_genome: Option<PathBuf>,
+
+        /// Discard reads with 2-mer Shannon richness below this value (omit to disable).
+        #[arg(long)]
+        rm_lowcomplex: Option<f64>,
+
+        /// Phred quality score offset (33 for Sanger/Illumina 1.8+, 64 for Illumina 1.3–1.7).
+        /// Only relevant when quality-based filter options are used.
+        #[arg(long, default_value_t = 33)]
+        phred_offset: u8,
+
         /// Write JSON stats (reads_in / reads_out) to this file instead of stdout
         #[arg(long, short = 'o')]
         output: Option<PathBuf>,

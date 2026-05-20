@@ -1279,6 +1279,18 @@ fn main() -> io::Result<()> {
             orient,
             compress,
             threads,
+            trunc_q,
+            trunc_len,
+            trim_left,
+            trim_right,
+            max_len,
+            min_len,
+            max_n,
+            min_q,
+            max_ee,
+            phix_genome,
+            rm_lowcomplex,
+            phred_offset,
             output,
             compact,
             verbose,
@@ -1294,6 +1306,39 @@ fn main() -> io::Result<()> {
                     b
                 }
             });
+            let filter_params = if trunc_q.is_some()
+                || trunc_len.is_some()
+                || trim_left.is_some()
+                || trim_right.is_some()
+                || max_len.is_some()
+                || min_len.is_some()
+                || max_n.is_some()
+                || min_q.is_some()
+                || max_ee.is_some()
+                || phix_genome.is_some()
+                || rm_lowcomplex.is_some()
+            {
+                let phix_seq: Option<Vec<u8>> = phix_genome
+                    .as_deref()
+                    .map(read_fasta_first_seq)
+                    .transpose()?;
+                Some(FilterParams {
+                    trunc_q: trunc_q.unwrap_or(0),
+                    trunc_len: trunc_len.unwrap_or(0),
+                    trim_left: trim_left.unwrap_or(0),
+                    trim_right: trim_right.unwrap_or(0),
+                    max_len: max_len.unwrap_or(0),
+                    min_len: min_len.unwrap_or(0),
+                    max_n: max_n.unwrap_or(usize::MAX),
+                    min_q: min_q.unwrap_or(0),
+                    max_ee: max_ee.unwrap_or(f64::INFINITY),
+                    phix_genome: phix_seq,
+                    rm_lowcomplex: rm_lowcomplex.unwrap_or(0.0),
+                    phred_offset,
+                })
+            } else {
+                None
+            };
             let params = RemovePrimersParams {
                 primer_fwd: primer_fwd.into_bytes(),
                 primer_rev: primer_rev_bytes,
@@ -1302,6 +1347,7 @@ fn main() -> io::Result<()> {
                 trim_fwd,
                 trim_rev,
                 orient,
+                filter_params,
             };
             let sample = sample_name.unwrap_or_else(|| fastq_stem(&input));
             let stats = remove_primers(&input, &fout, &params, compress, threads, verbose)?;

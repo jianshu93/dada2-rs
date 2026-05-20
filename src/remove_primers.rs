@@ -16,6 +16,7 @@ use noodles::bgzf;
 use noodles::fastq;
 use rayon::prelude::*;
 
+use crate::filter_trim::{FilterParams, filter_read};
 use crate::misc::WithPath;
 
 const CHUNK_SIZE: usize = 4096;
@@ -340,6 +341,7 @@ pub struct RemovePrimersParams {
     pub trim_fwd: bool,
     pub trim_rev: bool,
     pub orient: bool,
+    pub filter_params: Option<FilterParams>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -418,11 +420,14 @@ fn process_read(
         return None;
     }
 
-    Some((
-        work_seq[trim_start..trim_end].to_vec(),
-        work_qual[trim_start..trim_end].to_vec(),
-        reoriented,
-    ))
+    let trimmed_seq = &work_seq[trim_start..trim_end];
+    let trimmed_qual = &work_qual[trim_start..trim_end];
+    let (out_seq, out_qual) = if let Some(fp) = &params.filter_params {
+        filter_read(trimmed_seq, trimmed_qual, fp)?
+    } else {
+        (trimmed_seq.to_vec(), trimmed_qual.to_vec())
+    };
+    Some((out_seq, out_qual, reoriented))
 }
 
 // ---------------------------------------------------------------------------
@@ -688,6 +693,7 @@ mod tests {
             trim_fwd: true,
             trim_rev: true,
             orient: false,
+            filter_params: None,
         };
         let result = process_read(seq, qual, &params);
         assert_eq!(
@@ -715,6 +721,7 @@ mod tests {
             trim_fwd: true,
             trim_rev: false,
             orient: true,
+            filter_params: None,
         };
         let result = process_read(seq, qual, &params);
         // RC of GGGTTT = AAACCC; after trimming fwd primer (AAA), seq = CCC
@@ -737,6 +744,7 @@ mod tests {
             trim_fwd: true,
             trim_rev: false,
             orient: false,
+            filter_params: None,
         };
         assert!(process_read(seq, qual, &params).is_none());
     }
@@ -839,6 +847,7 @@ mod tests {
             trim_fwd: true,
             trim_rev: false,
             orient: false,
+            filter_params: None,
         };
         let result = process_read(seq, qual, &params);
         assert!(
