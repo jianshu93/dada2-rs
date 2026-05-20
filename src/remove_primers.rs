@@ -333,6 +333,16 @@ pub fn iupac_reverse_complement(seq: &[u8]) -> Vec<u8> {
 // Public types
 // ---------------------------------------------------------------------------
 
+/// Per-read outcome from `process_read`, distinguishing the discard reason.
+enum ReadOutcome {
+    /// Primers found and read passed all filters.
+    Passed(Vec<u8>, Vec<u8>, bool), // (seq, qual, reoriented)
+    /// Forward (or reverse) primer not found; read discarded.
+    NoPrimer,
+    /// Primers found and trimmed, but read rejected by quality filter params.
+    FilterFail,
+}
+
 pub struct RemovePrimersParams {
     pub primer_fwd: Vec<u8>,
     pub primer_rev: Option<Vec<u8>>,
@@ -349,6 +359,7 @@ pub struct PrimerStats {
     pub reads_in: u64,
     pub reads_out: u64,
     pub reads_reoriented: u64,
+    pub reads_filter_fail: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -357,14 +368,9 @@ pub struct PrimerStats {
 
 /// Apply primer detection and trimming to one read.
 ///
-/// Returns `Some((trimmed_seq, trimmed_qual, reoriented))` when the read
-/// passes, where `reoriented` is `true` if the read was reverse-complemented
-/// before trimming.  Returns `None` when the read should be discarded.
-fn process_read(
-    seq: &[u8],
-    qual: &[u8],
-    params: &RemovePrimersParams,
-) -> Option<(Vec<u8>, Vec<u8>, bool)> {
+/// Returns a [`ReadOutcome`] distinguishing primer failures from filter
+/// failures, to allow separate accounting in the caller.
+fn process_read(seq: &[u8], qual: &[u8], params: &RemovePrimersParams) -> ReadOutcome {
     let mm = params.max_mismatch;
     let find_fwd = |p: &[u8], r: &[u8]| {
         if params.allow_indels {
@@ -390,10 +396,12 @@ fn process_read(
         (None, true) => {
             let rc_seq = reverse_complement(seq);
             let rc_qual: Vec<u8> = qual.iter().copied().rev().collect();
-            let rc_hit = find_fwd(&params.primer_fwd, &rc_seq)?;
-            (rc_seq, rc_qual, rc_hit, true)
+            match find_fwd(&params.primer_fwd, &rc_seq) {
+                Some(hit) => (rc_seq, rc_qual, hit, true),
+                None => return ReadOutcome::NoPrimer,
+            }
         }
-        (None, false) => return None,
+        (None, false) => return ReadOutcome::NoPrimer,
     };
 
     // Reverse primer: require last match in the (possibly flipped) read.
@@ -403,7 +411,7 @@ fn process_read(
         .map(|rev| find_rev(rev, &work_seq));
 
     if let Some(None) = rev_hit {
-        return None; // rev primer provided but not found
+        return ReadOutcome::NoPrimer; // rev primer provided but not found
     }
     let rev_hit = rev_hit.flatten();
 
@@ -417,17 +425,18 @@ fn process_read(
     };
 
     if trim_end <= trim_start {
-        return None;
+        return ReadOutcome::NoPrimer;
     }
 
     let trimmed_seq = &work_seq[trim_start..trim_end];
     let trimmed_qual = &work_qual[trim_start..trim_end];
-    let (out_seq, out_qual) = if let Some(fp) = &params.filter_params {
-        filter_read(trimmed_seq, trimmed_qual, fp)?
-    } else {
-        (trimmed_seq.to_vec(), trimmed_qual.to_vec())
-    };
-    Some((out_seq, out_qual, reoriented))
+    match &params.filter_params {
+        Some(fp) => match filter_read(trimmed_seq, trimmed_qual, fp) {
+            Some((out_seq, out_qual)) => ReadOutcome::Passed(out_seq, out_qual, reoriented),
+            None => ReadOutcome::FilterFail,
+        },
+        None => ReadOutcome::Passed(trimmed_seq.to_vec(), trimmed_qual.to_vec(), reoriented),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -515,6 +524,7 @@ pub fn remove_primers(
     let mut reads_in: u64 = 0;
     let mut reads_out: u64 = 0;
     let mut reads_reoriented: u64 = 0;
+    let mut reads_filter_fail: u64 = 0;
     let mut record = fastq::Record::default();
 
     type ReadRecord = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
@@ -546,9 +556,8 @@ pub fn remove_primers(
         }
         reads_in += batch.len() as u64;
 
-        type ProcessResult = Option<(Vec<u8>, Vec<u8>, bool)>;
         // Process all reads in the chunk in parallel using the local pool.
-        let results: Vec<ProcessResult> = pool.install(|| {
+        let results: Vec<ReadOutcome> = pool.install(|| {
             batch
                 .par_iter()
                 .map(|(_, _, seq, qual)| process_read(seq, qual, params))
@@ -557,43 +566,77 @@ pub fn remove_primers(
 
         // Write passing reads in original order (single-threaded I/O).
         for ((name, desc, _, _), result) in batch.iter().zip(results.iter()) {
-            if let Some((seq_out, qual_out, reoriented)) = result {
-                write_record(&mut *writer, name, desc, seq_out, qual_out)?;
-                reads_out += 1;
-                if *reoriented {
-                    reads_reoriented += 1;
+            match result {
+                ReadOutcome::Passed(seq_out, qual_out, reoriented) => {
+                    write_record(&mut *writer, name, desc, seq_out, qual_out)?;
+                    reads_out += 1;
+                    if *reoriented {
+                        reads_reoriented += 1;
+                    }
                 }
+                ReadOutcome::FilterFail => reads_filter_fail += 1,
+                ReadOutcome::NoPrimer => {}
             }
         }
     }
 
     writer.flush()?;
 
+    let reads_primer_fail = reads_in - reads_out - reads_filter_fail;
     if reads_out == 0 {
         drop(writer);
         let _ = std::fs::remove_file(output);
         if verbose {
-            eprintln!(
-                "[remove-primers] {} — no reads passed primer detection, output not written",
-                input.display()
-            );
+            if reads_filter_fail > 0 && reads_primer_fail == 0 {
+                eprintln!(
+                    "[remove-primers] {} — primers found in all {} reads but all {} were rejected by quality filters; output not written",
+                    input.display(),
+                    reads_in,
+                    reads_filter_fail,
+                );
+            } else if reads_filter_fail > 0 {
+                eprintln!(
+                    "[remove-primers] {} — no reads passed: {} had no primer, {} rejected by quality filters; output not written",
+                    input.display(),
+                    reads_primer_fail,
+                    reads_filter_fail,
+                );
+            } else {
+                eprintln!(
+                    "[remove-primers] {} — no reads passed primer detection, output not written",
+                    input.display()
+                );
+            }
         }
     } else if verbose {
         let pct = reads_out as f64 * 100.0 / reads_in as f64;
-        eprintln!(
-            "[remove-primers] {} → {} reads in, {} out ({:.1}%), {} reoriented",
-            input.display(),
-            reads_in,
-            reads_out,
-            pct,
-            reads_reoriented,
-        );
+        if reads_filter_fail > 0 {
+            eprintln!(
+                "[remove-primers] {} → {} reads in, {} out ({:.1}%), {} reoriented, {} filtered",
+                input.display(),
+                reads_in,
+                reads_out,
+                pct,
+                reads_reoriented,
+                reads_filter_fail,
+            );
+        } else {
+            eprintln!(
+                "[remove-primers] {} → {} reads in, {} out ({:.1}%), {} reoriented",
+                input.display(),
+                reads_in,
+                reads_out,
+                pct,
+                reads_reoriented,
+            );
+        }
     }
 
     Ok(PrimerStats {
         reads_in,
         reads_out,
         reads_reoriented,
+        reads_filter_fail,
     })
 }
 
@@ -696,15 +739,13 @@ mod tests {
             filter_params: None,
         };
         let result = process_read(seq, qual, &params);
-        assert_eq!(
-            result.as_ref().map(|(s, _, _)| s.as_slice()),
-            Some(b"CCC".as_slice())
-        );
-        assert_eq!(
-            result.as_ref().map(|(_, q, _)| q.as_slice()),
-            Some(b"III".as_slice())
-        );
-        assert_eq!(result.as_ref().map(|&(_, _, r)| r), Some(false));
+        if let ReadOutcome::Passed(ref seq, ref qual, reoriented) = result {
+            assert_eq!(seq.as_slice(), b"CCC");
+            assert_eq!(qual.as_slice(), b"III");
+            assert!(!reoriented);
+        } else {
+            panic!("expected Passed, got {:?}", std::mem::discriminant(&result));
+        }
     }
 
     #[test]
@@ -725,11 +766,12 @@ mod tests {
         };
         let result = process_read(seq, qual, &params);
         // RC of GGGTTT = AAACCC; after trimming fwd primer (AAA), seq = CCC
-        assert_eq!(
-            result.as_ref().map(|(s, _, _)| s.as_slice()),
-            Some(b"CCC".as_slice())
-        );
-        assert_eq!(result.as_ref().map(|&(_, _, r)| r), Some(true));
+        if let ReadOutcome::Passed(ref seq, _, reoriented) = result {
+            assert_eq!(seq.as_slice(), b"CCC");
+            assert!(reoriented);
+        } else {
+            panic!("expected Passed");
+        }
     }
 
     #[test]
@@ -746,7 +788,10 @@ mod tests {
             orient: false,
             filter_params: None,
         };
-        assert!(process_read(seq, qual, &params).is_none());
+        assert!(matches!(
+            process_read(seq, qual, &params),
+            ReadOutcome::NoPrimer
+        ));
     }
 
     // -------------------------------------------------------------------------
@@ -850,15 +895,13 @@ mod tests {
             filter_params: None,
         };
         let result = process_read(seq, qual, &params);
-        assert!(
-            result.is_some(),
-            "read should pass with 1-deletion indel tolerance"
-        );
-        // Trimmed region starts after the matched primer region
-        let (trimmed_seq, _, _) = result.unwrap();
-        assert!(
-            !trimmed_seq.starts_with(b"AGT"),
-            "primer region should be trimmed"
-        );
+        if let ReadOutcome::Passed(ref trimmed_seq, _, _) = result {
+            assert!(
+                !trimmed_seq.starts_with(b"AGT"),
+                "primer region should be trimmed"
+            );
+        } else {
+            panic!("read should pass with 1-deletion indel tolerance");
+        }
     }
 }

@@ -1339,6 +1339,18 @@ fn main() -> io::Result<()> {
             } else {
                 None
             };
+            // Validate filter params before processing.
+            if let Some(ref fp) = filter_params {
+                if fp.max_len > 0 && fp.min_len > fp.max_len {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "--min-len ({}) is greater than --max-len ({}); no read can satisfy both",
+                            fp.min_len, fp.max_len
+                        ),
+                    ));
+                }
+            }
             let params = RemovePrimersParams {
                 primer_fwd: primer_fwd.into_bytes(),
                 primer_rev: primer_rev_bytes,
@@ -1358,6 +1370,11 @@ fn main() -> io::Result<()> {
                 reads_in: u64,
                 reads_out: u64,
                 reads_reoriented: u64,
+                #[serde(skip_serializing_if = "is_zero")]
+                reads_filter_fail: u64,
+            }
+            fn is_zero(v: &u64) -> bool {
+                *v == 0
             }
             let tagged = Tagged::new(
                 "remove-primers",
@@ -1366,6 +1383,7 @@ fn main() -> io::Result<()> {
                     reads_in: stats.reads_in,
                     reads_out: stats.reads_out,
                     reads_reoriented: stats.reads_reoriented,
+                    reads_filter_fail: stats.reads_filter_fail,
                 },
             );
             let json = if compact {
