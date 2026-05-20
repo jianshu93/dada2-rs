@@ -1110,6 +1110,8 @@ pub enum Commands {
         loess_preset: String,
 
         /// LOESS fitting surface (overrides preset).
+        /// Only applies to `--errfun loess` and `--errfun pacbio`; ignored by
+        /// `noqual`, `binned-qual`, and `external`.
         ///
         /// `direct` evaluates the local polynomial at every query point
         /// (matches R `loess(surface = "direct")`).  `interpolate` builds a
@@ -1119,19 +1121,22 @@ pub enum Commands {
         loess_surface: Option<String>,
 
         /// Maximum fraction of observations allowed per kd-tree cell before
-        /// it is subdivided.  Only used with `--loess-surface interpolate`.
+        /// it is subdivided.  Only used with `--loess-surface interpolate`
+        /// (i.e. `loess` and `pacbio` errfuns only).
         /// Mirrors R `loess.control(cell = ...)`; R's default is 0.2.
         #[arg(long)]
         loess_cell: Option<f64>,
 
-        /// Upper clamp on off-diagonal error rates from the LOESS errfun.
-        /// Both presets default to 0.25 (matching R DADA2's `loessErrfun`).
+        /// Upper clamp applied to off-diagonal error rates after fitting.
+        /// Applies to `loess`, `pacbio`, `noqual`, and `binned-qual`; ignored
+        /// by `external`.  Both presets default to 0.25 (matching R DADA2).
         /// Set to `1.0` to disable.
         #[arg(long)]
         loess_max_rate: Option<f64>,
 
-        /// Lower clamp on off-diagonal error rates from the LOESS errfun.
-        /// Both presets default to 1e-7 (matching R DADA2's `loessErrfun`).
+        /// Lower clamp applied to off-diagonal error rates after fitting.
+        /// Applies to `loess`, `pacbio`, `noqual`, and `binned-qual`; ignored
+        /// by `external`.  Both presets default to 1e-7 (matching R DADA2).
         /// Set to `0.0` to disable.
         #[arg(long)]
         loess_min_rate: Option<f64>,
@@ -1341,6 +1346,8 @@ pub enum Commands {
         loess_preset: String,
 
         /// LOESS fitting surface (overrides preset).
+        /// Only applies to `--errfun loess` and `--errfun pacbio`; ignored by
+        /// `noqual`, `binned-qual`, and `external`.
         ///
         /// `direct` evaluates the local polynomial at every query point
         /// (matches R `loess(surface = "direct")`).  `interpolate` builds a
@@ -1350,19 +1357,22 @@ pub enum Commands {
         loess_surface: Option<String>,
 
         /// Maximum fraction of observations allowed per kd-tree cell before
-        /// it is subdivided.  Only used with `--loess-surface interpolate`.
+        /// it is subdivided.  Only used with `--loess-surface interpolate`
+        /// (i.e. `loess` and `pacbio` errfuns only).
         /// Mirrors R `loess.control(cell = ...)`; R's default is 0.2.
         #[arg(long)]
         loess_cell: Option<f64>,
 
-        /// Upper clamp on off-diagonal error rates from the LOESS errfun.
-        /// Both presets default to 0.25 (matching R DADA2's `loessErrfun`).
+        /// Upper clamp applied to off-diagonal error rates after fitting.
+        /// Applies to `loess`, `pacbio`, `noqual`, and `binned-qual`; ignored
+        /// by `external`.  Both presets default to 0.25 (matching R DADA2).
         /// Set to `1.0` to disable.
         #[arg(long)]
         loess_max_rate: Option<f64>,
 
-        /// Lower clamp on off-diagonal error rates from the LOESS errfun.
-        /// Both presets default to 1e-7 (matching R DADA2's `loessErrfun`).
+        /// Lower clamp applied to off-diagonal error rates after fitting.
+        /// Applies to `loess`, `pacbio`, `noqual`, and `binned-qual`; ignored
+        /// by `external`.  Both presets default to 1e-7 (matching R DADA2).
         /// Set to `0.0` to disable.
         #[arg(long)]
         loess_min_rate: Option<f64>,
