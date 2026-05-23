@@ -139,6 +139,22 @@ fn build_learned_err_params(
     }
 }
 
+#[derive(Serialize, Copy, Clone)]
+struct DadaRunParams {
+    omega_a: f64,
+    omega_c: f64,
+    omega_p: f64,
+    min_fold: f64,
+    min_hamming: u32,
+    min_abund: u32,
+    detect_singletons: bool,
+    band: i32,
+    homo_gap_p: i32,
+    kdist_cutoff: f64,
+    kmer_size: usize,
+    use_kmers: bool,
+}
+
 fn main() -> io::Result<()> {
     let cli = Cli::parse();
 
@@ -652,6 +668,7 @@ fn main() -> io::Result<()> {
                 total_reads: u32,
                 asvs: Vec<AsvEntry>,
                 stats: DadaStats,
+                params: DadaRunParams,
                 map: Vec<Option<usize>>,
                 #[serde(skip_serializing_if = "Option::is_none")]
                 aux: Option<AuxJson>,
@@ -744,6 +761,20 @@ fn main() -> io::Result<()> {
                 stats: DadaStats {
                     nalign: result.nalign,
                     nshroud: result.nshroud,
+                },
+                params: DadaRunParams {
+                    omega_a,
+                    omega_c,
+                    omega_p,
+                    min_fold,
+                    min_hamming,
+                    min_abund,
+                    detect_singletons,
+                    band,
+                    homo_gap_p,
+                    kdist_cutoff,
+                    kmer_size,
+                    use_kmers,
                 },
                 map: result.map,
                 aux: aux_json,
@@ -1047,8 +1078,24 @@ fn main() -> io::Result<()> {
                 total_reads: u32,
                 asvs: Vec<AsvEntry>,
                 stats: DadaStats,
+                params: DadaRunParams,
                 map: Vec<Option<usize>>,
             }
+
+            let run_params = DadaRunParams {
+                omega_a,
+                omega_c,
+                omega_p,
+                min_fold,
+                min_hamming,
+                min_abund,
+                detect_singletons,
+                band,
+                homo_gap_p,
+                kdist_cutoff,
+                kmer_size,
+                use_kmers,
+            };
 
             for (s, sample_name) in sample_names.iter().enumerate() {
                 // Sum per-cluster reads for this sample by walking its local uniques.
@@ -1109,6 +1156,7 @@ fn main() -> io::Result<()> {
                         nalign: result.nalign,
                         nshroud: result.nshroud,
                     },
+                    params: run_params,
                     map,
                 };
 
