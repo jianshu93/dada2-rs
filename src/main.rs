@@ -102,18 +102,24 @@ fn build_learned_err_params(
     dp: &dada::DadaParams,
     ap: &AlignParams,
 ) -> LearnedErrParams {
-    let (errfun_name, errfun_pseudocount, errfun_bins, errfun_cmd) = match errfun {
-        ErrFun::Loess { .. } => ("loess", None, None, None),
-        ErrFun::Noqual { pseudocount, .. } => ("noqual", Some(*pseudocount), None, None),
-        ErrFun::BinnedQual { bins, .. } => ("binned-qual", None, Some(bins.clone()), None),
-        ErrFun::PacBio { .. } => ("pacbio", None, None, None),
-        ErrFun::External { command } => ("external", None, None, Some(command.clone())),
+    let (errfun_name, errfun_pseudocount, errfun_bins, errfun_cmd, loess_cfg) = match errfun {
+        ErrFun::Loess { config } => ("loess", None, None, None, Some(config)),
+        ErrFun::Noqual {
+            pseudocount,
+            config,
+        } => ("noqual", Some(*pseudocount), None, None, Some(config)),
+        ErrFun::BinnedQual { bins, config } => {
+            ("binned-qual", None, Some(bins.clone()), None, Some(config))
+        }
+        ErrFun::PacBio { config } => ("pacbio", None, None, None, Some(config)),
+        ErrFun::External { command } => ("external", None, None, Some(command.clone()), None),
     };
     LearnedErrParams {
         errfun: errfun_name.to_string(),
         errfun_pseudocount,
         errfun_bins,
         errfun_cmd,
+        loess: loess_cfg.map(Into::into),
         max_consist,
         omega_a: dp.omega_a,
         // Deliberately not embedded: learn-time `omega_c` (R default 0)

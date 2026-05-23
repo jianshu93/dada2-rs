@@ -24,7 +24,7 @@ use crate::containers::Raw;
 use crate::dada::{DadaParams, RawInput, dada_uniques_cached};
 use crate::derep::dereplicate;
 use crate::error_models::{
-    LoessConfig, accumulate_trans, binned_qual_errfun, external_errfun, loess_errfun,
+    LoessConfig, LoessSurface, accumulate_trans, binned_qual_errfun, external_errfun, loess_errfun,
     noqual_errfun, pacbio_errfun,
 };
 use crate::misc::WithPath;
@@ -198,6 +198,46 @@ pub struct LearnedErrParams {
     pub vectorized: bool,
     #[serde(default)]
     pub gapless: bool,
+
+    /// Loess configuration captured from the errfun. Present for errfuns that
+    /// use loess fitting (`loess`, `noqual`, `binned-qual`, `pacbio`); absent
+    /// for `external`. Records the resolved surface/cell/clamp values *after*
+    /// any CLI overrides on top of `--loess-preset`, so the same JSON
+    /// distinguishes runs that differed only in loess settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loess: Option<LoessParams>,
+}
+
+/// Loess fitting parameters embedded in [`LearnedErrParams::loess`].
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct LoessParams {
+    /// `"direct"` or `"interpolate"`.
+    #[serde(default)]
+    pub surface: String,
+    /// kd-tree cell parameter; only set when `surface == "interpolate"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell: Option<f64>,
+    /// Upper clamp applied to off-diagonal error rates.
+    #[serde(default)]
+    pub max_error_rate: f64,
+    /// Lower clamp applied to off-diagonal error rates.
+    #[serde(default)]
+    pub min_error_rate: f64,
+}
+
+impl From<&LoessConfig> for LoessParams {
+    fn from(c: &LoessConfig) -> Self {
+        let (surface, cell) = match c.surface {
+            LoessSurface::Direct => ("direct".to_string(), None),
+            LoessSurface::Interpolate { cell } => ("interpolate".to_string(), Some(cell)),
+        };
+        LoessParams {
+            surface,
+            cell,
+            max_error_rate: c.max_error_rate,
+            min_error_rate: c.min_error_rate,
+        }
+    }
 }
 
 /// Outcome of the self-consistency iteration in `learn_errors`.
