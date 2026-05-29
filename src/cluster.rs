@@ -11,35 +11,19 @@ use crate::containers::{B, Bi, BirthType, Comparison};
 use crate::nwalign::{AlignBuffers, AlignParams, sub_new_with_buf};
 use crate::pval::compute_lambda;
 
-/// Default grain when `DADA2_RS_PAR_GRAIN` is unset or invalid.
-const DEFAULT_PAR_GRAIN: usize = 32;
-
 /// Maximum chunk size for the parallel raw-compare loop in `b_compare_parallel`
 /// (passed to rayon's `with_max_len`). Default `32`. Overridable for tuning via
 /// the `DADA2_RS_PAR_GRAIN` env var (must be > 0; invalid values fall back to
 /// the default). Read once per process and cached. Undocumented in `--help`:
 /// this is a tuning knob, not user-facing config.
-///
-/// On the first call (the only time the env var is consulted), emits a one-line
-/// stderr note so the chosen grain is visible in run logs: silent when the var
-/// is unset, confirms the override when valid, warns when set but unparseable
-/// (so a typo like `GRAIN=foo` doesn't silently run at the default).
 fn par_max_len() -> usize {
     static VALUE: OnceLock<usize> = OnceLock::new();
-    *VALUE.get_or_init(|| match std::env::var("DADA2_RS_PAR_GRAIN") {
-        Err(_) => DEFAULT_PAR_GRAIN,
-        Ok(raw) => match raw.parse::<usize>() {
-            Ok(n) if n > 0 => {
-                eprintln!("[cluster] DADA2_RS_PAR_GRAIN={n} (parallel compare grain)");
-                n
-            }
-            _ => {
-                eprintln!(
-                    "[cluster] warning: DADA2_RS_PAR_GRAIN={raw:?} is not a positive integer; using default grain {DEFAULT_PAR_GRAIN}"
-                );
-                DEFAULT_PAR_GRAIN
-            }
-        },
+    *VALUE.get_or_init(|| {
+        std::env::var("DADA2_RS_PAR_GRAIN")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(32)
     })
 }
 
@@ -358,9 +342,7 @@ pub fn b_bud(
             b.assign_center(new_ci);
 
             if verbose {
-                eprintln!(
-                    "\n\t[cluster] Division (naive): Raw {raw_idx} from Bi {ci}, pA={p_a:.2e}"
-                );
+                eprintln!(", Division (naive): Raw {raw_idx} from Bi {ci}, pA={p_a:.2e}");
             }
             return Some(new_ci);
         }
@@ -388,24 +370,26 @@ pub fn b_bud(
             b.assign_center(new_ci);
 
             if verbose {
-                eprintln!(
-                    "\n\t[cluster] Division (prior): Raw {raw_idx} from Bi {ci}, pP={p_p:.2e}"
-                );
+                eprintln!(", Division (prior): Raw {raw_idx} from Bi {ci}, pP={p_p:.2e}");
             }
             return Some(new_ci);
         }
     }
 
     if verbose {
-        let (raw_idx_str, ci_str) = match mini {
+        let (raw_idx_str, reads, ci_str) = match mini {
             Some((ci, r, _)) => {
                 let raw_idx = b.clusters[ci].raws[r];
-                (raw_idx.to_string(), ci.to_string())
+                (raw_idx.to_string(), b.raws[raw_idx].reads, ci.to_string())
             }
-            None => (init_center.to_string(), String::from("0")),
+            None => (
+                init_center.to_string(),
+                b.raws[init_center].reads,
+                String::from("0"),
+            ),
         };
         eprintln!(
-            "\n\t[cluster] No Division. Minimum pA={p_a:.2e} (Raw {raw_idx_str} in Bi {ci_str})."
+            ", No Division. Minimum pA={p_a:.2e} (Raw {raw_idx_str} w/ {reads} reads in Bi {ci_str})."
         );
     }
     None

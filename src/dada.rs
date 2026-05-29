@@ -544,7 +544,7 @@ pub fn run_dada(raws: Vec<Raw>, params: &DadaParams) -> B {
         };
 
         if params.verbose {
-            eprint!("[dada] New Cluster C{newi}:");
+            eprint!("\nNew Cluster C{newi}:");
         }
 
         if params.multithread {
@@ -581,7 +581,7 @@ pub fn run_dada(raws: Vec<Raw>, params: &DadaParams) -> B {
             }
         }
         if params.verbose && nshuffle >= MAX_SHUFFLE {
-            eprintln!(" Warning: Reached maximum ({MAX_SHUFFLE}) shuffles.");
+            eprintln!("Warning: Reached maximum ({MAX_SHUFFLE}) shuffles.");
         }
 
         b_p_update(&mut bb, params.greedy, params.detect_singletons);
@@ -589,7 +589,7 @@ pub fn run_dada(raws: Vec<Raw>, params: &DadaParams) -> B {
 
     if params.verbose {
         eprintln!(
-            "[dada] ALIGN: {} aligns, {} shrouded ({} raw).",
+            "\nALIGN: {} aligns, {} shrouded ({} raw).",
             bb.nalign,
             bb.nshroud,
             bb.raws.len()
