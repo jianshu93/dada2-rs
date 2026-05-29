@@ -61,6 +61,7 @@ class Segment:
         "raw",
         "step",
         "sample",
+        "reported_clusters",
     )
 
     def __init__(self, step):
@@ -74,6 +75,7 @@ class Segment:
         self.raw = None
         self.step = step  # self-consistency step label, if known
         self.sample = None  # dada2-rs per-sample index, if known
+        self.reported_clusters = None  # authoritative count from rs sample line
 
     @property
     def final_clusters(self):
@@ -88,21 +90,25 @@ def parse(lines):
     cur_step = None
     cur = Segment(cur_step)
 
+    interleaved = False
+    cur_last_cluster = 0  # for monotonicity check within a segment
+
     for line in lines:
-        # Wrapper / annotation lines first.
+        # Wrapper / annotation lines. NOTE: do not `continue` — a wrapper
+        # marker can share a physical line with a trace token. R prints
+        # "selfConsist step N" with no trailing newline, so the step's first
+        # ", Division (naive): ..." lands on the same line and must still be
+        # counted below.
         m = RE_R_STEP.search(line)
         if m:
             cur_step = int(m.group(1))
             cur.step = cur_step
-            continue
         m = RE_RS_SAMPLE.search(line)
         if m:
             rs_samples.append((int(m.group(1)), int(m.group(2)), int(m.group(3))))
-            continue
         m = RE_RS_ITER.search(line)
         if m:
             rs_iters.append((int(m.group(1)), m.group(2)))
-            continue
 
         # Trace tokens (a physical line may carry a New Cluster + its shuffle
         # run + the division that births the *next* cluster).
@@ -110,6 +116,14 @@ def parse(lines):
         if m:
             cur.new_clusters += 1
             cur.shuffles += len(m.group(2))
+            # Within one (single-threaded) dada run, cluster numbers increase
+            # monotonically. A repeat or decrease means several samples' traces
+            # are interleaved on one stream (multithreaded dada2-rs), so the
+            # per-run breakdown can't be trusted — only the totals can.
+            c = int(m.group(1))
+            if c <= cur_last_cluster:
+                interleaved = True
+            cur_last_cluster = c
         cur.naive += len(RE_NAIVE.findall(line))
         cur.prior += len(RE_PRIOR.findall(line))
         cur.nodiv += len(RE_NODIV.findall(line))
@@ -121,20 +135,26 @@ def parse(lines):
             cur.raw = int(m.group(3))
             segments.append(cur)
             cur = Segment(cur_step)
+            cur_last_cluster = 0
 
     # If the stream ended mid-run (no trailing ALIGN) but work was recorded,
     # keep the partial segment so nothing is silently dropped.
     if cur.new_clusters or cur.naive or cur.prior or cur.nodiv:
         segments.append(cur)
 
-    # dada2-rs emits one `iter=N sample=S: C cluster(s)` line per dada run,
-    # in the same order as the ALIGN segments — pair them when counts match.
-    if rs_samples and len(rs_samples) == len(segments):
-        for seg, (it, samp, _clusters) in zip(segments, rs_samples):
+    # dada2-rs emits one `iter=N sample=S: C cluster(s)` line per dada run, in
+    # the same order as the ALIGN segments. The init pass (MAX_CLUST=1) adds
+    # leading ALIGN segments with no sample line, so attach to the trailing
+    # segments. The reported cluster count is authoritative even when the
+    # per-run trace is interleaved.
+    if rs_samples and len(rs_samples) <= len(segments):
+        offset = len(segments) - len(rs_samples)
+        for seg, (it, samp, clusters) in zip(segments[offset:], rs_samples):
             seg.step = it
             seg.sample = samp
+            seg.reported_clusters = clusters
 
-    return segments, rs_samples, rs_iters
+    return segments, rs_samples, rs_iters, interleaved
 
 
 def fmt_int(v):
@@ -185,7 +205,27 @@ def print_table(segments):
         print(fmt.format(*r))
 
 
-def print_summary(segments, rs_iters):
+def print_sample_table(segments):
+    """Authoritative per-sample cluster counts from dada2-rs `iter sample` lines.
+
+    Reliable even when the trace is interleaved, since these come from
+    discrete post-run summary lines rather than the mixed cluster trace.
+    """
+    rows = [s for s in segments if s.reported_clusters is not None]
+    if not rows:
+        return
+    print()
+    print("authoritative per-sample cluster counts (dada2-rs):")
+    header = ["iter", "sample", "clusters"]
+    body = [[str(s.step), str(s.sample), f"{s.reported_clusters:,}"] for s in rows]
+    widths = [max(len(header[c]), max(len(r[c]) for r in body)) for c in range(3)]
+    fmt = "  ".join("{:>" + str(w) + "}" for w in widths)
+    print("  " + fmt.format(*header))
+    for r in body:
+        print("  " + fmt.format(*r))
+
+
+def print_summary(segments, rs_iters, interleaved):
     n_runs = len(segments)
     tot_naive = sum(s.naive for s in segments)
     tot_prior = sum(s.prior for s in segments)
@@ -199,7 +239,9 @@ def print_summary(segments, rs_iters):
     print(f"total alignments           : {tot_aligns:,}  ({tot_shroud:,} shrouded)")
     if tot_aligns and n_runs:
         print(f"mean aligns / run          : {tot_aligns / n_runs:,.0f}")
-    if tot_new != tot_naive + tot_prior:
+    # The new-cluster/division balance check is only meaningful for a
+    # non-interleaved trace; interleaving produces orphaned tokens by design.
+    if not interleaved and tot_new != tot_naive + tot_prior:
         print(
             f"  note: new-cluster count ({tot_new}) != naive+prior divisions "
             f"({tot_naive + tot_prior}); trace may be truncated"
@@ -230,7 +272,7 @@ def main():
     )
     args = ap.parse_args()
 
-    segments, _rs_samples, rs_iters = parse(args.input)
+    segments, _rs_samples, rs_iters, interleaved = parse(args.input)
 
     if not segments:
         print("No dada/ALIGN trace lines found in input.", file=sys.stderr)
@@ -240,9 +282,18 @@ def main():
         )
         sys.exit(1)
 
+    if interleaved:
+        print(
+            "WARNING: cluster numbers are non-monotonic — this looks like a\n"
+            "multithreaded run with several samples' traces interleaved on one\n"
+            "stream. Per-run rows below mix samples and are NOT reliable; trust\n"
+            "the totals and the authoritative per-sample counts instead.\n"
+        )
+
     if not args.no_table:
         print_table(segments)
-    print_summary(segments, rs_iters)
+    print_sample_table(segments)
+    print_summary(segments, rs_iters, interleaved)
 
 
 if __name__ == "__main__":
