@@ -592,32 +592,66 @@ fn dploop(
     gap_p: i16,
     swap: bool,
 ) {
+    // Bind exact-length subslices up front so the per-cell accesses below
+    // carry no bounds checks: the single range-slice panics at most once
+    // (before the loop), then the zipped iterators are checkless. This is
+    // what lets LLVM auto-vectorize — computed-offset indexing inside the
+    // loop (`d_prev[left_off + k]`) inserts a panic branch per access that
+    // blocks the vectorizer.
+    let left = &d_prev[left_off..left_off + n];
+    let up = &d_prev[up_off..up_off + n];
+    let diag = &diag_buf[col_min..col_min + n];
+    let d_out = &mut d[out_off..out_off + n];
+    let p_out = &mut p[out_off..out_off + n];
+
     // `saturating_add` instead of plain `+` so that at-or-beyond i16 range
     // (long reads, ~>4kbp at default scoring) scores pin to the bounds
     // deterministically rather than wrapping; the outer length guard in
     // raw_align still routes truly long inputs to the i32 path. The LLVM
-    // auto-vectorizer lowers saturating i16 adds to `paddsw`/`psubsw`, so
-    // the cost vs plain `+` is negligible on any SSE2+ target.
-    for k in 0..n {
-        let left = d_prev[left_off + k].saturating_add(gap_p);
-        let diag = diag_buf[col_min + k];
-        let up = d_prev[up_off + k].saturating_add(gap_p);
-
-        let (entry, pentry) = if swap {
-            // left ≥ up ≥ diag
-            if left >= up { (left, 2i16) } else { (up, 3i16) }
-        } else {
-            // up ≥ left ≥ diag
-            if up >= left { (up, 3i16) } else { (left, 2i16) }
-        };
-        let (entry, pentry) = if entry >= diag {
-            (entry, pentry)
-        } else {
-            (diag, 1i16)
-        };
-
-        d[out_off + k] = entry;
-        p[out_off + k] = pentry;
+    // auto-vectorizer lowers saturating i16 adds to `paddsw`/`psubsw`.
+    //
+    // The `swap` precedence is loop-invariant, so it selects one of two
+    // branch-free loop bodies rather than being tested per cell (matches the
+    // C++ `dploop_vec` / `dploop_vec_swap` split). Diag wins only when it is
+    // strictly greater, preserving the original `entry >= diag` tie-break.
+    if swap {
+        // precedence: left ≥ up ≥ diag
+        for ((((o, pp), &l), &u), &dg) in d_out
+            .iter_mut()
+            .zip(p_out.iter_mut())
+            .zip(left)
+            .zip(up)
+            .zip(diag)
+        {
+            let l = l.saturating_add(gap_p);
+            let u = u.saturating_add(gap_p);
+            let (mut entry, mut pentry) = if l >= u { (l, 2i16) } else { (u, 3i16) };
+            if dg > entry {
+                entry = dg;
+                pentry = 1;
+            }
+            *o = entry;
+            *pp = pentry;
+        }
+    } else {
+        // precedence: up ≥ left ≥ diag
+        for ((((o, pp), &l), &u), &dg) in d_out
+            .iter_mut()
+            .zip(p_out.iter_mut())
+            .zip(left)
+            .zip(up)
+            .zip(diag)
+        {
+            let l = l.saturating_add(gap_p);
+            let u = u.saturating_add(gap_p);
+            let (mut entry, mut pentry) = if u >= l { (u, 3i16) } else { (l, 2i16) };
+            if dg > entry {
+                entry = dg;
+                pentry = 1;
+            }
+            *o = entry;
+            *pp = pentry;
+        }
     }
 }
 
