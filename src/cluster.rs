@@ -342,7 +342,7 @@ pub fn b_bud(
             b.assign_center(new_ci);
 
             if verbose {
-                eprintln!(", Division (naive): Raw {raw_idx} from Bi {ci}, pA={p_a:.2e}");
+                eprint!(", Division (naive): Raw {raw_idx} from Bi {ci}, pA={p_a:.2e}");
             }
             return Some(new_ci);
         }
@@ -370,7 +370,7 @@ pub fn b_bud(
             b.assign_center(new_ci);
 
             if verbose {
-                eprintln!(", Division (prior): Raw {raw_idx} from Bi {ci}, pP={p_p:.2e}");
+                eprint!(", Division (prior): Raw {raw_idx} from Bi {ci}, pP={p_p:.2e}");
             }
             return Some(new_ci);
         }
@@ -388,7 +388,7 @@ pub fn b_bud(
                 String::from("0"),
             ),
         };
-        eprintln!(
+        eprint!(
             ", No Division. Minimum pA={p_a:.2e} (Raw {raw_idx_str} w/ {reads} reads in Bi {ci_str})."
         );
     }
