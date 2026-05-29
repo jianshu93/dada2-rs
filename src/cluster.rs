@@ -11,19 +11,35 @@ use crate::containers::{B, Bi, BirthType, Comparison};
 use crate::nwalign::{AlignBuffers, AlignParams, sub_new_with_buf};
 use crate::pval::compute_lambda;
 
+/// Default grain when `DADA2_RS_PAR_GRAIN` is unset or invalid.
+const DEFAULT_PAR_GRAIN: usize = 32;
+
 /// Maximum chunk size for the parallel raw-compare loop in `b_compare_parallel`
 /// (passed to rayon's `with_max_len`). Default `32`. Overridable for tuning via
 /// the `DADA2_RS_PAR_GRAIN` env var (must be > 0; invalid values fall back to
 /// the default). Read once per process and cached. Undocumented in `--help`:
 /// this is a tuning knob, not user-facing config.
+///
+/// On the first call (the only time the env var is consulted), emits a one-line
+/// stderr note so the chosen grain is visible in run logs: silent when the var
+/// is unset, confirms the override when valid, warns when set but unparseable
+/// (so a typo like `GRAIN=foo` doesn't silently run at the default).
 fn par_max_len() -> usize {
     static VALUE: OnceLock<usize> = OnceLock::new();
-    *VALUE.get_or_init(|| {
-        std::env::var("DADA2_RS_PAR_GRAIN")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(32)
+    *VALUE.get_or_init(|| match std::env::var("DADA2_RS_PAR_GRAIN") {
+        Err(_) => DEFAULT_PAR_GRAIN,
+        Ok(raw) => match raw.parse::<usize>() {
+            Ok(n) if n > 0 => {
+                eprintln!("[cluster] DADA2_RS_PAR_GRAIN={n} (parallel compare grain)");
+                n
+            }
+            _ => {
+                eprintln!(
+                    "[cluster] warning: DADA2_RS_PAR_GRAIN={raw:?} is not a positive integer; using default grain {DEFAULT_PAR_GRAIN}"
+                );
+                DEFAULT_PAR_GRAIN
+            }
+        },
     })
 }
 
