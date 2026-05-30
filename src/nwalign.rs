@@ -78,7 +78,10 @@ pub struct AlignBuffers {
     p32: Vec<u8>,
     // Vectorized DP (align_vectorized).
     d16: Vec<i16>,
-    p16: Vec<i16>,
+    // Traceback pointers hold only 0..=3, so `u8` halves this matrix's
+    // memory traffic vs `i16`. The DP kernel is bandwidth-bound on the
+    // streamed `d`/`p` writes, so the narrower store is a direct win.
+    p8: Vec<u8>,
     diag_buf: Vec<i16>,
     // Homopolymer masks (align_endsfree_homo).
     homo1: Vec<bool>,
@@ -581,7 +584,7 @@ pub fn align_gapless_with_buf(s1: &[u8], s2: &[u8], buf: &mut AlignBuffers) {
 #[allow(clippy::too_many_arguments)]
 fn dploop(
     d: &mut [i16],
-    p: &mut [i16],
+    p: &mut [u8],
     d_prev: &[i16],
     diag_buf: &[i16],
     left_off: usize,
@@ -625,10 +628,10 @@ fn dploop(
         {
             let l = l.saturating_add(gap_p);
             let u = u.saturating_add(gap_p);
-            let (mut entry, mut pentry) = if l >= u { (l, 2i16) } else { (u, 3i16) };
+            let (mut entry, mut pentry) = if l >= u { (l, 2u8) } else { (u, 3u8) };
             if dg > entry {
                 entry = dg;
-                pentry = 1;
+                pentry = 1u8;
             }
             *o = entry;
             *pp = pentry;
@@ -644,10 +647,10 @@ fn dploop(
         {
             let l = l.saturating_add(gap_p);
             let u = u.saturating_add(gap_p);
-            let (mut entry, mut pentry) = if u >= l { (u, 3i16) } else { (l, 2i16) };
+            let (mut entry, mut pentry) = if u >= l { (u, 3u8) } else { (l, 2u8) };
             if dg > entry {
                 entry = dg;
-                pentry = 1;
+                pentry = 1u8;
             }
             *o = entry;
             *pp = pentry;
@@ -704,10 +707,10 @@ pub fn align_vectorized_with_buf(
     let nrow = len1 + len2 + 1;
 
     reset_buf(&mut buf.d16, ncol * nrow, 0i16);
-    reset_buf(&mut buf.p16, ncol * nrow, 0i16);
+    reset_buf(&mut buf.p8, ncol * nrow, 0u8);
     reset_buf(&mut buf.diag_buf, ncol, 0i16);
     let d = &mut buf.d16[..ncol * nrow];
-    let p = &mut buf.p16[..ncol * nrow];
+    let p = &mut buf.p8[..ncol * nrow];
     let diag_buf = &mut buf.diag_buf[..ncol];
 
     // Sentinel fill: columns 0,1 and ncol-2,ncol-1 in every row act as hard
@@ -942,9 +945,9 @@ pub fn align_vectorized_with_buf(
     }
 
     // --- Traceback through compressed p matrix ---
-    // Reborrow via disjoint fields: p16 (shared) + al0/al1 (mutable each) are
+    // Reborrow via disjoint fields: p8 (shared) + al0/al1 (mutable each) are
     // three distinct fields of `buf`, so NLL permits holding them simultaneously.
-    let p_ro = &buf.p16[..ncol * nrow];
+    let p_ro = &buf.p8[..ncol * nrow];
     let al0 = &mut buf.al0;
     let al1 = &mut buf.al1;
     al0.clear();
