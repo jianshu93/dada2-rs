@@ -785,29 +785,49 @@ pub fn align_vectorized_with_buf(
         // We guard with explicit bounds checks and use fill_val so the sentinel
         // columns in d suppress any influence on the traceback.
         {
-            // Bind exact-length subslices so the per-cell writes/reads carry no
-            // bounds checks (the single range-slice panics at most once, before
-            // the loop) — the same de-bounds-checking that let `dploop`
-            // vectorize. `si`/`sj` are derived from the zip index `k`: `si`
-            // decrements (i64, may go negative — guarded) while `sj` increments.
-            // The guarded `s1[si]`/`s2[sj]` reads keep their bounds checks
-            // elided via the explicit range guard.
             let base = (row - 2) * ncol + col_min;
             let d_prev2 = &d[base..base + n];
             let diag_out = &mut diag_buf[col_min..col_min + n];
-            for (k, (dst, &prev)) in diag_out.iter_mut().zip(d_prev2).enumerate() {
-                let si = i_max - k as i64;
-                let sj = j_min + k;
-                let score = if si >= 0 && (si as usize) < len1 && sj < len2 {
-                    if s1[si as usize] == s2[sj] {
-                        match_score
-                    } else {
-                        mismatch
-                    }
-                } else {
-                    fill_val // out-of-range cell; sentinel ensures it won't affect traceback
-                };
-                *dst = prev.saturating_add(score);
+
+            // The in-bounds cells of this anti-diagonal form a contiguous range
+            // [k_lo, k_hi): `si = i_max - k` in [0, len1) and `sj = j_min + k`
+            // in [0, len2). Hoisting that bounds test out of the per-cell loop
+            // (computing the range once) lets the hot middle run guard-free with
+            // sequential `s1`/`s2` walks — matching R's branchless scalar
+            // diag-fill — while staying memory-safe (no null-terminator UB).
+            // Cells outside the range take `fill_val`; sentinel `d` columns then
+            // suppress any influence on the traceback.
+            let k_lo = (i_max - len1 as i64 + 1).clamp(0, n as i64) as usize;
+            let k_hi = (i_max + 1)
+                .min(len2 as i64 - j_min as i64)
+                .clamp(0, n as i64) as usize;
+            let k_hi = k_hi.max(k_lo);
+
+            // Boundary cells (si ≥ len1 below k_lo; si < 0 or sj ≥ len2 at/above
+            // k_hi): out of range.
+            for (dst, &prev) in diag_out[..k_lo].iter_mut().zip(&d_prev2[..k_lo]) {
+                *dst = prev.saturating_add(fill_val);
+            }
+            for (dst, &prev) in diag_out[k_hi..].iter_mut().zip(&d_prev2[k_hi..]) {
+                *dst = prev.saturating_add(fill_val);
+            }
+
+            // In-bounds middle, guard-free. `s2` is read forward; `s1` in reverse
+            // (si decreases as k increases). The slice bounds are provably valid
+            // because every k in [k_lo, k_hi) maps to an in-range si/sj.
+            if k_lo < k_hi {
+                let s1_mid =
+                    &s1[(i_max - (k_hi as i64 - 1)) as usize..=(i_max - k_lo as i64) as usize];
+                let s2_mid = &s2[j_min + k_lo..j_min + k_hi];
+                for (((dst, &prev), &a), &b) in diag_out[k_lo..k_hi]
+                    .iter_mut()
+                    .zip(&d_prev2[k_lo..k_hi])
+                    .zip(s1_mid.iter().rev())
+                    .zip(s2_mid.iter())
+                {
+                    let score = if a == b { match_score } else { mismatch };
+                    *dst = prev.saturating_add(score);
+                }
             }
         }
 
@@ -1494,6 +1514,62 @@ mod tests {
         let s1: Vec<u8> = (0..230).map(|_| next_nt(&mut state)).collect();
         let s2: Vec<u8> = (0..240).map(|_| next_nt(&mut state)).collect();
         compare_alignments(&s1, &s2, "diff-len-230-vs-240");
+    }
+
+    /// Randomized parity stress test for the diag-fill band-corner range
+    /// arithmetic: `align_vectorized` must match `align_endsfree`'s optimal
+    /// score across many random pairs (varied lengths, indels, bands). Run
+    /// explicitly (it does ~30k alignments):
+    ///   cargo test --release -- --ignored sweep_vectorized_parity --nocapture
+    #[test]
+    #[ignore]
+    fn sweep_vectorized_parity() {
+        let nts = [1u8, 2, 3, 4];
+        let mut st: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut rng = |st: &mut u64, m: usize| {
+            *st = st.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((*st >> 33) as usize) % m
+        };
+        let mut fails = 0;
+        for _ in 0..10_000 {
+            let len = 5 + rng(&mut st, 60);
+            let s1: Vec<u8> = (0..len).map(|_| nts[rng(&mut st, 4)]).collect();
+            let mut s2 = s1.clone();
+            for _ in 0..rng(&mut st, 5) {
+                if s2.is_empty() {
+                    break;
+                }
+                let p = rng(&mut st, s2.len());
+                match rng(&mut st, 3) {
+                    0 => s2[p] = nts[rng(&mut st, 4)],       // substitution
+                    1 => s2.insert(p, nts[rng(&mut st, 4)]), // insertion
+                    _ => {
+                        s2.remove(p);
+                    } // deletion
+                }
+            }
+            if s2.len() < 3 {
+                continue;
+            }
+            for &band in &[8i32, 16, 32] {
+                let ef = align_endsfree(&s1, &s2, 5, -4, -8, band);
+                let ve = align_vectorized(
+                    &s1,
+                    &s2,
+                    &VectorizedAlignScores {
+                        match_score: 5,
+                        mismatch: -4,
+                        gap_p: -8,
+                        end_gap_p: 0,
+                        band,
+                    },
+                );
+                if score_alignment(&ef, 5, -4, -8) != score_alignment(&ve, 5, -4, -8) {
+                    fails += 1;
+                }
+            }
+        }
+        assert_eq!(fails, 0, "vectorized/endsfree score parity must hold");
     }
 
     /// A distinct homopolymer gap penalty must route `raw_align` through the
