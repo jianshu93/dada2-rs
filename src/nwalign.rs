@@ -1129,13 +1129,21 @@ pub fn raw_align_with_buf(
         align_gapless_with_buf(&raw1.seq, &raw2.seq, buf);
         return Some(());
     }
+    // Homopolymer gapping: when a distinct homopolymer gap penalty is in
+    // effect, the alignment must use the homopolymer-aware scalar DP. The
+    // vectorized aligner has no homopolymer-gap support, so it is disabled in
+    // this mode — mirroring R DADA2, which forces `VECTORIZED_ALIGNMENT <-
+    // FALSE` whenever `HOMOPOLYMER_GAP_PENALTY != GAP_PENALTY` (dada.R:229-230).
+    // Without this, a `--homo-gap-p` setting would be silently ignored by the
+    // vectorized path and diverge from R.
+    let use_homo = p.homo_gap_p != p.gap_p && p.homo_gap_p <= 0;
     // Long-read guard: align_vectorized uses i16 DP tables. With the default
     // DADA2 scoring (match=5, mismatch=-4, gap_p=-8) cumulative scores can
     // approach ±8·N, so we must fall back to the i32 path before overflow
     // can distort the optimum. 3500 bp leaves ~10% headroom in i16 range.
     const VECTORIZED_MAX_LEN: usize = 3500;
     let too_long = raw1.len() > VECTORIZED_MAX_LEN || raw2.len() > VECTORIZED_MAX_LEN;
-    if p.vectorized && !too_long {
+    if p.vectorized && !too_long && !use_homo {
         align_vectorized_with_buf(
             &raw1.seq,
             &raw2.seq,
@@ -1150,7 +1158,7 @@ pub fn raw_align_with_buf(
         );
         return Some(());
     }
-    if p.homo_gap_p != p.gap_p && p.homo_gap_p <= 0 {
+    if use_homo {
         align_endsfree_homo_with_buf(&raw1.seq, &raw2.seq, p, buf);
         return Some(());
     }
@@ -1197,6 +1205,78 @@ pub fn sub_new_with_buf(
             .collect();
     }
     Some(sub)
+}
+
+#[cfg(test)]
+mod bench_align {
+    use super::*;
+
+    /// Isolated kernel micro-benchmark: time `align_vectorized_with_buf` on one
+    /// fixed sequence pair, many iterations, with a reused buffer. Strips away
+    /// every pipeline confound (k-mer screen, greedy, threading, counting) so
+    /// the per-alignment number is directly comparable to R's `nwalign(vec=TRUE)`.
+    ///
+    /// Reads a 2-record FASTA from the `BENCH_PAIR` env var (default
+    /// `/tmp/bench_pair.fasta`). Run explicitly:
+    ///   BENCH_PAIR=/tmp/bench_pair.fasta cargo test --release \
+    ///     -- --ignored bench_align_vectorized --nocapture
+    #[test]
+    #[ignore]
+    fn bench_align_vectorized() {
+        let path = std::env::var("BENCH_PAIR").unwrap_or_else(|_| "/tmp/bench_pair.fasta".into());
+        let text = std::fs::read_to_string(&path).expect("read BENCH_PAIR fasta");
+        let seqs: Vec<Vec<u8>> = text
+            .split('>')
+            .filter(|r| !r.trim().is_empty())
+            .map(|rec| {
+                let body: String = rec.lines().skip(1).collect();
+                body.bytes()
+                    .filter_map(|b| match b {
+                        b'A' | b'a' => Some(1u8),
+                        b'C' | b'c' => Some(2),
+                        b'G' | b'g' => Some(3),
+                        b'T' | b't' => Some(4),
+                        b'N' | b'n' => Some(5),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect();
+        assert!(seqs.len() >= 2, "need >=2 records in {path}");
+        let (s1, s2) = (&seqs[0], &seqs[1]);
+
+        let scores = VectorizedAlignScores {
+            match_score: 5,
+            mismatch: -4,
+            gap_p: -8,
+            end_gap_p: 0,
+            band: 32,
+        };
+        let mut buf = AlignBuffers::new();
+
+        // Warmup.
+        for _ in 0..200 {
+            align_vectorized_with_buf(s1, s2, &scores, &mut buf);
+        }
+
+        let iters = 20_000usize;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            align_vectorized_with_buf(s1, s2, &scores, &mut buf);
+            std::hint::black_box(buf.alignment());
+        }
+        let dt = t0.elapsed();
+
+        let us = dt.as_secs_f64() * 1e6 / iters as f64;
+        let aps = iters as f64 / dt.as_secs_f64();
+        println!(
+            "  align_vectorized: len1={} len2={} band=32  {:.2} us/align  {:.0} aligns/s  ({iters} iters)",
+            s1.len(),
+            s2.len(),
+            us,
+            aps,
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1406,5 +1486,73 @@ mod tests {
         let s1: Vec<u8> = (0..230).map(|_| next_nt(&mut state)).collect();
         let s2: Vec<u8> = (0..240).map(|_| next_nt(&mut state)).collect();
         compare_alignments(&s1, &s2, "diff-len-230-vs-240");
+    }
+
+    /// A distinct homopolymer gap penalty must route `raw_align` through the
+    /// homopolymer-aware scalar DP, not the vectorized aligner (which has no
+    /// homopolymer-gap support). Mirrors R DADA2 forcing VECTORIZED_ALIGNMENT
+    /// off when HOMOPOLYMER_GAP_PENALTY != GAP_PENALTY (dada.R:229-230).
+    #[test]
+    fn homo_gap_penalty_routes_to_homopolymer_aligner() {
+        // Unequal lengths force a gapped alignment (the gapless fast-path
+        // requires equal lengths). This pair is chosen so the homopolymer-aware
+        // and vectorized aligners place the gap *differently*: the cheap
+        // homopolymer gap (-1) is preferred inside the A-run, while the uniform
+        // gap (-8) vectorized path resolves it elsewhere — so the test
+        // genuinely distinguishes which aligner ran.
+        let s1 = encode("AGAAAAGGGGTTTAAAAAATTTTTCCCC");
+        let s2 = encode("AAAAAGGGGTTTAAAAAATTTTTCCCC");
+
+        let params = AlignParams {
+            match_score: 5,
+            mismatch: -4,
+            gap_p: -8,
+            homo_gap_p: -1,
+            use_kmers: true,
+            kdist_cutoff: 0.42,
+            kmer_size: 5,
+            band: 16,
+            vectorized: true, // must be overridden by the homopolymer branch
+            gapless: true,
+        };
+
+        // Reference: the homopolymer-aware aligner called directly.
+        let mut rbuf = AlignBuffers::new();
+        align_endsfree_homo_with_buf(&s1, &s2, &params, &mut rbuf);
+        let want = (rbuf.al0.clone(), rbuf.al1.clone());
+
+        // Sanity: the vectorized aligner gives a *different* alignment here, so
+        // this test genuinely distinguishes the dispatch (the pre-fix path used
+        // vectorized and would silently drop the homopolymer penalty).
+        let vec = align_vectorized(
+            &s1,
+            &s2,
+            &VectorizedAlignScores {
+                match_score: 5,
+                mismatch: -4,
+                gap_p: -8,
+                end_gap_p: 0,
+                band: 16,
+            },
+        );
+        assert_ne!(
+            (vec[0].clone(), vec[1].clone()),
+            want,
+            "test precondition: vectorized and homopolymer alignments must differ"
+        );
+
+        // Dispatched path with vectorized=true AND a homopolymer penalty set.
+        let mut r1 = Raw::new(s1, None, 10, false);
+        let mut r2 = Raw::new(s2, None, 5, false);
+        crate::kmers::raw_assign_kmers(&mut r1, params.kmer_size);
+        crate::kmers::raw_assign_kmers(&mut r2, params.kmer_size);
+
+        let mut buf = AlignBuffers::new();
+        raw_align_with_buf(&r1, &r2, &params, &mut buf).expect("alignment produced");
+        assert_eq!(
+            (buf.al0.clone(), buf.al1.clone()),
+            want,
+            "homopolymer gap penalty must use the homopolymer-aware aligner, not vectorized"
+        );
     }
 }
