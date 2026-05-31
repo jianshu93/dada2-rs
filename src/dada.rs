@@ -506,8 +506,10 @@ pub fn run_dada(raws: Vec<Raw>, params: &DadaParams) -> B {
         Duration::ZERO,
         Duration::ZERO,
     );
-    // Split of `compare` into the parallel alignment map vs. the serial store.
-    let (mut t_cmp_map, mut t_cmp_serial) = (Duration::ZERO, Duration::ZERO);
+    // Split of `compare` into the parallel alignment map vs. the serial store,
+    // plus summed worker-busy time to derive the map's parallel efficiency.
+    let (mut t_cmp_map, mut t_cmp_serial, mut t_cmp_busy) =
+        (Duration::ZERO, Duration::ZERO, Duration::ZERO);
 
     // Initial compare: no k-mer distance screen so that cluster 0 accumulates
     // comparisons for every Raw (required by b_shuffle2).
@@ -518,16 +520,18 @@ pub fn run_dada(raws: Vec<Raw>, params: &DadaParams) -> B {
 
     let t = Instant::now();
     if params.multithread {
-        let (m, s) = b_compare_parallel(
+        let (m, s, busy) = b_compare_parallel(
             &mut bb,
             0,
             &params.err_mat,
             params.err_ncol,
             &init_params,
             params.greedy,
+            params.verbose,
         );
         t_cmp_map += m;
         t_cmp_serial += s;
+        t_cmp_busy += busy;
     } else {
         b_compare(
             &mut bb,
@@ -571,16 +575,18 @@ pub fn run_dada(raws: Vec<Raw>, params: &DadaParams) -> B {
 
         let t = Instant::now();
         if params.multithread {
-            let (m, s) = b_compare_parallel(
+            let (m, s, busy) = b_compare_parallel(
                 &mut bb,
                 newi,
                 &params.err_mat,
                 params.err_ncol,
                 &params.align,
                 params.greedy,
+                params.verbose,
             );
             t_cmp_map += m;
             t_cmp_serial += s;
+            t_cmp_busy += busy;
         } else {
             b_compare(
                 &mut bb,
@@ -624,6 +630,16 @@ pub fn run_dada(raws: Vec<Raw>, params: &DadaParams) -> B {
             bb.nshroud,
             bb.raws.len()
         );
+        // Parallel efficiency of the map: worker-busy time / (map wall ×
+        // threads). Near 1.0 → threads compute the whole map wall (low OS-level
+        // utilization then implies memory-bandwidth stalls); well below 1.0 →
+        // threads idle inside the parallel region (tail load-imbalance).
+        let nthreads = rayon::current_num_threads().max(1);
+        let map_eff = if t_cmp_map.as_secs_f64() > 0.0 {
+            t_cmp_busy.as_secs_f64() / (t_cmp_map.as_secs_f64() * nthreads as f64)
+        } else {
+            0.0
+        };
         eprintln!(
             "[dada] phase times (serial except compare-map): compare={:.2}s (map={:.2}s parallel, store={:.2}s serial)  shuffle={:.2}s  bud={:.2}s  p_update={:.2}s",
             t_compare.as_secs_f64(),
@@ -632,6 +648,13 @@ pub fn run_dada(raws: Vec<Raw>, params: &DadaParams) -> B {
             t_shuffle.as_secs_f64(),
             t_bud.as_secs_f64(),
             t_pupdate.as_secs_f64(),
+        );
+        eprintln!(
+            "[dada] map parallel efficiency: {:.0}% (busy={:.0}s / map={:.0}s × {} threads)",
+            100.0 * map_eff,
+            t_cmp_busy.as_secs_f64(),
+            t_cmp_map.as_secs_f64(),
+            nthreads,
         );
     }
 

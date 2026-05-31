@@ -101,12 +101,13 @@ pub fn b_compare(
 
 /// Parallel version of `b_compare` using Rayon.
 /// Equivalent to C++ `b_compare_parallel`.
-/// Returns `(map, serial)` wall durations: time in the parallel alignment map
-/// vs. the serial post-processing store loop. Lets `run_dada` report the split
-/// under `--verbose` — distinguishing memory-bandwidth saturation in the
-/// parallel map from serial-store overhead as the cause of low thread
-/// utilization. Returned (not accumulated in a global) so it stays correct when
-/// multiple `run_dada` calls nest under per-sample parallelism.
+/// Returns `(map, serial, busy)` durations: `map` is the parallel-pass wall
+/// time, `serial` the post-processing store-loop wall time, and `busy` the
+/// summed per-item compute time across all worker threads. `busy / (map ×
+/// nthreads)` is the map's parallel efficiency — if well below 1, threads idle
+/// inside the parallel region (tail load-imbalance); near 1 with low OS-level
+/// utilization points to memory-bandwidth stalls instead. Returned (not
+/// global-accumulated) so it stays correct under nested per-sample parallelism.
 pub fn b_compare_parallel(
     b: &mut B,
     i: usize,
@@ -114,7 +115,12 @@ pub fn b_compare_parallel(
     ncol: usize,
     params: &AlignParams,
     greedy: bool,
-) -> (std::time::Duration, std::time::Duration) {
+    measure: bool,
+) -> (
+    std::time::Duration,
+    std::time::Duration,
+    std::time::Duration,
+) {
     let center_idx = b.clusters[i]
         .center
         .expect("b_compare_parallel: cluster has no center");
@@ -142,12 +148,17 @@ pub fn b_compare_parallel(
     // benefit more. Smaller values (16, 8) were not meaningfully better at
     // 8 threads, but may help at higher thread counts — override via the
     // `DADA2_RS_PAR_GRAIN` env var to tune for your workload.
-    let comps: Vec<(f64, u32, bool)> = (0..nraw)
+    // Per-item compute time (4th tuple field, nanos) is summed after collect to
+    // get total worker-busy time without cross-thread atomic contention.
+    let comps: Vec<(f64, u32, bool, u64)> = (0..nraw)
         .into_par_iter()
         .with_max_len(par_max_len())
         .map_init(AlignBuffers::new, |buf, index| {
+            // Per-item timing only under `measure` (verbose) — keeps the hot
+            // alignment loop allocation/Instant-free in production runs.
+            let t0 = measure.then(std::time::Instant::now);
             let raw = &raws[index];
-            if greedy && (raw.reads > center_reads || raw.lock) {
+            let (lambda, hamming, skipped) = if greedy && (raw.reads > center_reads || raw.lock) {
                 let lambda = compute_lambda(raw, None, err_mat, ncol, use_quals);
                 (lambda, u32::MAX, true)
             } else {
@@ -155,15 +166,18 @@ pub fn b_compare_parallel(
                 let lambda = compute_lambda(raw, sub.as_ref(), err_mat, ncol, use_quals);
                 let hamming = sub.as_ref().map_or(u32::MAX, |s| s.nsubs() as u32);
                 (lambda, hamming, false)
-            }
+            };
+            let nanos = t0.map_or(0, |t| t.elapsed().as_nanos() as u64);
+            (lambda, hamming, skipped, nanos)
         })
         .collect();
     let map_dur = t_map.elapsed();
+    let busy_dur = std::time::Duration::from_nanos(comps.iter().map(|c| c.3).sum());
 
     // Serial post-processing: selectively store comparisons.
     let t_serial = std::time::Instant::now();
     let total_reads = b.reads as f64;
-    for (index, (lambda, hamming, skipped)) in comps.into_iter().enumerate() {
+    for (index, (lambda, hamming, skipped, _busy)) in comps.into_iter().enumerate() {
         // Match serial b_compare counting: only count non-skipped raws.
         if !skipped {
             b.nalign += 1;
@@ -194,7 +208,7 @@ pub fn b_compare_parallel(
             }
         }
     }
-    (map_dur, t_serial.elapsed())
+    (map_dur, t_serial.elapsed(), busy_dur)
 }
 
 // ---------------------------------------------------------------------------
