@@ -195,8 +195,12 @@ pub enum Commands {
 
         /// K-mer size used for the pre-alignment screen and for the Raw
         /// k-mer vectors (matches R's `KMER_SIZE`). 5 is the DADA2 default,
-        /// tuned for 16S/ITS-length amplicons. Valid range: 3..=8.
-        /// Memory scales as 4^k per Raw (k=5 → 1KB, k=7 → 16KB).
+        /// tuned for 16S/ITS-length amplicons. Valid range: 3..=8 (8 is the
+        /// hard ceiling — k-mer indices must fit in u16). For PacBio HiFi, k=6
+        /// is recommended: on ~1.4 kb reads the screen is a no-op at k=5 (every
+        /// pair is aligned), but it engages at k=6 — ~4× faster with identical
+        /// ASVs and error model. Memory scales as 4^k per Raw (k=5 → 1KB,
+        /// k=6 → 4KB, k=7 → 16KB, k=8 → 64KB).
         #[arg(long)]
         kmer_size: Option<usize>,
 
@@ -1199,8 +1203,12 @@ pub enum Commands {
 
         /// K-mer size used for the pre-alignment screen and for the Raw
         /// k-mer vectors (matches R's `KMER_SIZE`). 5 is the DADA2 default,
-        /// tuned for 16S/ITS-length amplicons. Valid range: 3..=8.
-        /// Memory scales as 4^k per Raw (k=5 → 1KB, k=7 → 16KB).
+        /// tuned for 16S/ITS-length amplicons. Valid range: 3..=8 (8 is the
+        /// hard ceiling — k-mer indices must fit in u16). For PacBio HiFi, k=6
+        /// is recommended: on ~1.4 kb reads the screen is a no-op at k=5 (every
+        /// pair is aligned), but it engages at k=6 — ~4× faster with identical
+        /// ASVs and error model. Memory scales as 4^k per Raw (k=5 → 1KB,
+        /// k=6 → 4KB, k=7 → 16KB, k=8 → 64KB).
         #[arg(long, default_value_t = 5)]
         kmer_size: usize,
 
@@ -1435,8 +1443,12 @@ pub enum Commands {
 
         /// K-mer size used for the pre-alignment screen and for the Raw
         /// k-mer vectors (matches R's `KMER_SIZE`). 5 is the DADA2 default,
-        /// tuned for 16S/ITS-length amplicons. Valid range: 3..=8.
-        /// Memory scales as 4^k per Raw (k=5 → 1KB, k=7 → 16KB).
+        /// tuned for 16S/ITS-length amplicons. Valid range: 3..=8 (8 is the
+        /// hard ceiling — k-mer indices must fit in u16). For PacBio HiFi, k=6
+        /// is recommended: on ~1.4 kb reads the screen is a no-op at k=5 (every
+        /// pair is aligned), but it engages at k=6 — ~4× faster with identical
+        /// ASVs and error model. Memory scales as 4^k per Raw (k=5 → 1KB,
+        /// k=6 → 4KB, k=7 → 16KB, k=8 → 64KB).
         #[arg(long, default_value_t = 5)]
         kmer_size: usize,
 
