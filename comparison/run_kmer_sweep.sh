@@ -56,7 +56,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DADA2RS="${SCRIPT_DIR}/../target/release/dada2-rs"
+DADA2RS="${SCRIPT_DIR}/../target/release-native/dada2-rs"
 
 INPUT="${1:?Usage: run_kmer_sweep.sh <dir|glob|file> [outdir] [errfun] [band] [k-list]}"
 OUTDIR="${2:-${SCRIPT_DIR}/kmer_sweep_out}"
@@ -116,6 +116,27 @@ fi
 NSAMPLES=${#INPUTS[@]}
 echo "==> ${NSAMPLES} sample(s):"
 for f in "${INPUTS[@]}"; do echo "      $f"; done
+
+# Paired-end footgun guard: pooling forward (R1) and reverse (R2) reads into one
+# table is wrong — they cover different strands/regions and don't align, so the
+# k-mer screen would shroud nearly everything and the ASVs would be meaningless.
+# DADA2 denoises each orientation SEPARATELY. Warn (don't abort — some naming
+# schemes legitimately contain "R1"/"R2" substrings) if both appear.
+n_r1=0; n_r2=0
+for f in "${INPUTS[@]}"; do
+    b="$(basename "$f")"
+    [[ "$b" == *_R1[._]* || "$b" == *_R1.* ]] && n_r1=$((n_r1+1))
+    [[ "$b" == *_R2[._]* || "$b" == *_R2.* ]] && n_r2=$((n_r2+1))
+done
+if [[ $n_r1 -gt 0 && $n_r2 -gt 0 ]]; then
+    echo "WARNING: input mixes forward (R1: ${n_r1}) and reverse (R2: ${n_r2}) reads." >&2
+    echo "         DADA2 denoises each orientation separately; pooling them gives" >&2
+    echo "         meaningless ASVs. Run the sweep once per orientation, e.g.:" >&2
+    echo "           FILE_GLOB='*_R1_001.fastq.gz' bash $0 <dir> <out>_R1 ..." >&2
+    echo "           FILE_GLOB='*_R2_001.fastq.gz' bash $0 <dir> <out>_R2 ..." >&2
+    echo "         Continuing anyway in 3s (Ctrl-C to abort)..." >&2
+    sleep 3
+fi
 
 POOLED=0
 [[ $NSAMPLES -gt 1 ]] && POOLED=1
