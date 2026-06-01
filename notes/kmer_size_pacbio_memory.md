@@ -220,3 +220,102 @@ k=5 stays the safe global default; **k=6 is the practical pick for speed/memory*
 (fastest, lowest non-default footprint) with no ASV downside; k≥7 buys nothing on
 Illumina and costs heavily at k=8. The recommendation is now backed by a 61-sample
 pooled run, not a single sample.
+
+---
+
+## Downstream: merging paired reads across k (manual)
+
+For paired-end Illumina the per-orientation ASVs must be merged into full-length
+amplicons (`merge-pairs`). The k-mer screen does **not** run in `merge-pairs` —
+it re-dereplicates and does its own ends-free NW with no k-mer screen — so k
+affects merging only *indirectly*, through the upstream R1/R2 ASV differences.
+The question merging answers is therefore: **do the per-k ASV differences survive
+into the merged amplicons, or wash out?** This step is run by hand (it is
+cross-orientation, so it consumes the R1 sweep dir + R2 sweep dir together).
+
+The sweep writes one dada JSON per sample under `<outdir>/dada_k<k>/`. For each k,
+merge the matching R1/R2 dada outputs, supplying the filtered FASTQs (re-dereplicated
+to recover read→unique maps). Files match by position, so sort all four globs the
+same way (here the shared sample stems guarantee it):
+
+```bash
+R1=out_R1   # the R1 sweep outdir
+R2=out_R2   # the R2 sweep outdir
+FQ1=filtered/R1   # filtered forward FASTQs (one per sample)
+FQ2=filtered/R2   # filtered reverse FASTQs
+
+for k in 5 6 7 8; do
+  dada2-rs merge-pairs \
+    --fwd-dada  "$R1"/dada_k${k}/*.json \
+    --rev-dada  "$R2"/dada_k${k}/*.json \
+    --fwd-fastq "$FQ1"/*.fastq.gz \
+    --rev-fastq "$FQ2"/*.fastq.gz \
+    --min-overlap 12 --max-mismatch 0 --threads 8 \
+    -o merged_k${k}.json
+done
+```
+
+Output schema (per k): `{ "samples": [ { "sample", "total_pairs",
+"accepted_pairs", "num_merged", "merged": [ {"sequence","abundance","accept"} ] } ] }`.
+
+### Metrics to compare across k
+
+**(a) merged ASV count + merge rate** — pooled over samples:
+
+```bash
+for k in 5 6 7 8; do
+  python3 - "$k" merged_k${k}.json <<'PY'
+import json, sys
+k, path = sys.argv[1], sys.argv[2]
+d = json.load(open(path))
+seqs, tot, acc = set(), 0, 0
+for s in d["samples"]:
+    tot += s["total_pairs"]; acc += s["accepted_pairs"]
+    seqs |= {m["sequence"] for m in s["merged"] if m.get("accept")}
+print(f"k={k}  merged_ASVs={len(seqs)}  merge_rate={acc/tot:.3f}  ({acc}/{tot})")
+PY
+done
+```
+
+**(b) merged ASV-set diff vs k=5** — the decisive sequence-level check (the
+cross-orientation analogue of the still-open R2 question above):
+
+```bash
+python3 - <<'PY'
+import json
+def merged_set(path):
+    d = json.load(open(path)); out=set()
+    for s in d["samples"]:
+        out |= {m["sequence"] for m in s["merged"] if m.get("accept")}
+    return out
+base = merged_set("merged_k5.json")
+print(f"baseline k=5: {len(base)} merged ASVs")
+for k in (6,7,8):
+    s = merged_set(f"merged_k{k}.json")
+    print(f"  k={k}: shared={len(base&s)} only_k5={len(base-s)} "
+          f"only_k{k}={len(s-base)} "
+          f"[{'IDENTICAL' if base==s else 'DIFFERS'}]")
+PY
+```
+
+If the merged sets come out IDENTICAL (or differ by ≪ the pre-merge ASV-count
+spread), the upstream k-sensitivity washes out at the amplicon level — the
+strongest possible "k doesn't matter for final output" result. If they differ,
+(b) is exactly the sequence-level evidence needed to close the open question above.
+
+### Worked example (2 MiSeq SOP samples, k=5 vs k=6, verified)
+
+Filtered F3D0+F3D1 (truncLen 240/160), swept each orientation, merged per the
+commands above (min-overlap 12, max-mismatch 0):
+
+```
+k=5  merged_ASVs=144  merge_rate=0.955  (11630/12173)
+k=6  merged_ASVs=144  merge_rate=0.955  (11631/12177)
+  k=6 vs k=5: shared=144 only_k5=0 only_k6=0  [IDENTICAL]
+```
+
+The merged amplicon set is **identical** and the merge rate is unchanged, even
+though k can nudge the pre-merge R1/R2 ASV counts. So on this data the upstream
+k-sensitivity washes out completely after merging — pairing is robust to the
+k-mer-screen size. (Worth repeating on the full 61-sample set and across k=7/8 to
+confirm, but the 2-sample result is a strong indicator.)
