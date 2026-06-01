@@ -215,32 +215,55 @@ fi
 # Step 1: per-k learn-errors (pooled over all samples) + dada / dada-pooled.
 # All samples and parameters are held constant; only --kmer-size changes.
 # ---------------------------------------------------------------------------
-# Portable wall-time + peak-RSS capture. GNU coreutils `time` (Linux clusters)
-# uses `-v`; BSD `time` (macOS) uses `-l`. Probe once and pick the flag. If
-# neither works, fall back to no external timer (wall/RSS columns stay blank,
-# but the run still completes). The parser in Step 2 understands both formats.
-TIME_BIN=/usr/bin/time
-TIME_FLAG=""
-if [[ -x "$TIME_BIN" ]]; then
-    if "$TIME_BIN" -v true >/dev/null 2>&1; then
-        TIME_FLAG="-v"        # GNU time
-    elif "$TIME_BIN" -l true >/dev/null 2>&1; then
-        TIME_FLAG="-l"        # BSD time
-    fi
-fi
-if [[ -z "$TIME_FLAG" ]]; then
-    echo "WARNING: no usable /usr/bin/time (-v or -l); wall_s / maxrss columns will be blank." >&2
+# Wall-time + peak-RSS capture.
+#
+# Wall time is ALWAYS captured via the bash `time` builtin (SECONDS), which
+# needs no external binary — many clusters ship only the bash `time` keyword
+# and have no /usr/bin/time at all.
+#
+# Peak RSS additionally needs an external timer: GNU coreutils `time -v`
+# (Linux) or BSD `time -l` (macOS). We probe for one; if absent, RSS stays
+# blank (a WARNING is printed) but wall time is unaffected. The Step-2 parser
+# understands both timer formats and the "WALL_S=" line emitted below.
+EXT_TIME_BIN=""
+EXT_TIME_FLAG=""
+for cand in /usr/bin/time /opt/homebrew/bin/gtime /usr/local/bin/gtime "$(command -v gtime 2>/dev/null)"; do
+    [[ -n "$cand" && -x "$cand" ]] || continue
+    if "$cand" -v true >/dev/null 2>&1; then EXT_TIME_BIN="$cand"; EXT_TIME_FLAG="-v"; break; fi
+    if "$cand" -l true >/dev/null 2>&1; then EXT_TIME_BIN="$cand"; EXT_TIME_FLAG="-l"; break; fi
+done
+if [[ -z "$EXT_TIME_BIN" ]]; then
+    echo "NOTE: no external timer (/usr/bin/time -v/-l or gtime) found;" >&2
+    echo "      wall_s will still be captured, but maxrss_kb will be blank." >&2
 fi
 
-# Run "$@" under the timer, sending the timer's report AND the command's stderr
-# to $1 (the time file). Usage: run_timed <timefile> <cmd...>
+# High-resolution-ish wall clock: GNU `date +%s.%N` where available, else the
+# integer bash SECONDS counter. (BSD date lacks %N and returns a literal "N",
+# which we detect and fall back from.)
+_now() {
+    local t
+    t=$(date +%s.%N 2>/dev/null)
+    if [[ "$t" == *N* || -z "$t" ]]; then echo "$SECONDS"; else echo "$t"; fi
+}
+
+# Run "$@", capturing the command's stderr AND a wall-time line into $1.
+# If an external timer exists, its report (incl. peak RSS) is appended too.
+# Usage: run_timed <logfile> <cmd...>
 run_timed() {
     local tf="$1"; shift
-    if [[ -n "$TIME_FLAG" ]]; then
-        "$TIME_BIN" "$TIME_FLAG" "$@" >/dev/null 2>"$tf"
+    local start end rc
+    start=$(_now)
+    if [[ -n "$EXT_TIME_BIN" ]]; then
+        "$EXT_TIME_BIN" "$EXT_TIME_FLAG" "$@" >/dev/null 2>"$tf"
     else
         "$@" >/dev/null 2>"$tf"
     fi
+    rc=$?
+    end=$(_now)
+    # Append a parser-friendly wall-time line. awk handles float subtraction
+    # portably (bash can't do float arithmetic).
+    awk -v s="$start" -v e="$end" 'BEGIN{ printf "WALL_S=%.2f\n", e - s }' >> "$tf"
+    return $rc
 }
 
 SUMMARY_CSV="${OUTDIR}/summary.csv"
@@ -356,22 +379,29 @@ def parse_time(tf):
     if not os.path.exists(tf): return ("", "")
     wall = rss = ""
     txt = open(tf, errors="replace").read()
-    m = re.search(r"^\s*([\d.]+)\s+real", txt, re.M)   # BSD: "3.14 real"
+    # Wall time: prefer the always-present "WALL_S=" line that run_timed appends
+    # (bash builtin clock, no external binary needed). Fall back to an external
+    # timer's report if for some reason the line is missing.
+    m = re.search(r"^WALL_S=([\d.]+)", txt, re.M)
     if m:
         wall = m.group(1)
     else:
-        # GNU: "Elapsed (wall clock) time (h:mm:ss or m:ss): [h:]mm:ss[.ss]"
-        m = re.search(r"wall clock.*?:\s*([\d:.]+)\s*$", txt, re.M)
+        m = re.search(r"^\s*([\d.]+)\s+real", txt, re.M)   # BSD: "3.14 real"
         if m:
-            parts = m.group(1).split(":")
-            secs = 0.0
-            for p in parts:               # accumulate h:m:s or m:s or s
-                secs = secs * 60 + float(p)
-            wall = f"{secs:g}"
-    m = re.search(r"(\d+)\s+maximum resident set size", txt)
+            wall = m.group(1)
+        else:
+            # GNU: "Elapsed (wall clock) time (h:mm:ss or m:ss): [h:]mm:ss[.ss]"
+            m = re.search(r"wall clock.*?:\s*([\d:.]+)\s*$", txt, re.M)
+            if m:
+                secs = 0.0
+                for p in m.group(1).split(":"):   # h:m:s or m:s or s
+                    secs = secs * 60 + float(p)
+                wall = f"{secs:g}"
+    # Peak RSS: external timer only (no portable shell equivalent).
+    m = re.search(r"(\d+)\s+maximum resident set size", txt)   # BSD: bytes
     if m: rss = str(round(int(m.group(1))/1024))
     else:
-        m = re.search(r"Maximum resident set size \(kbytes\):\s*(\d+)", txt)
+        m = re.search(r"Maximum resident set size \(kbytes\):\s*(\d+)", txt)  # GNU: kB
         if m: rss = m.group(1)
     return (wall, rss)
 
