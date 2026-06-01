@@ -153,3 +153,70 @@ result (identical ASVs at 79 % shroud) should be confirmed on a second sample or
 a pooled run before changing any default. Scratch artifacts were purged from
 `/tmp`; re-run to reproduce exact `err_out` diffs. The memory model and the
 k=5-is-a-no-op-on-long-reads finding are robust (mechanistic + measured).
+
+---
+
+## Full MiSeq SOP confirmation (2026-06-01)
+
+The caveat above (single Illumina sample) is now addressed: a sweep on the
+**full MiSeq SOP** dataset (61 samples, learn-errors pooled per-sample then
+denoised, R1 and R2 separately) via `comparison/run_kmer_sweep.sh`. Errfun
+loess, band 16, k = 5/6/7/8.
+
+### R1
+
+| k | learn_iters | dada_aligns | dada_shrouded | shroud % | n_asv | wall (s) |
+|---|------------|-------------|---------------|----------|-------|----------|
+| 5 | 6  | 473 091 080 | 354 857 588 | 42.9 | 2514 | 238.8 |
+| 6 | 6  | 476 322 636 | 400 154 558 | 45.7 | 2529 | 182.4 |
+| 7 | 7  | 475 915 226 | 422 244 675 | 47.0 | 2525 | 236.4 |
+| 8 | 6  | 475 626 964 | 437 773 435 | 47.9 | 2520 | 616.7 |
+
+### R2
+
+| k | learn_iters | dada_aligns | dada_shrouded | shroud % | n_asv | wall (s) |
+|---|------------|-------------|---------------|----------|-------|----------|
+| 5 | 10*| 398 005 481 | 296 195 546 | 42.7 | 1991 | 175.6 |
+| 6 | 7  | 401 707 229 | 336 741 954 | 45.6 | 2004 | 137.5 |
+| 7 | 6  | 404 084 016 | 360 688 524 | 47.2 | 2015 | 206.2 |
+| 8 | 7  | 404 545 391 | 371 782 216 | 47.9 | 2016 | 538.1 |
+
+\* R2/k5 hit the `--max-consist 10` cap. The log shows this is **oscillation,
+not slow convergence**: max|err_in−err_out| reached 1.78e-6 at iter 6 (already
+converged), then bounced back to a stuck 1.17e-5 two-state cycle through iter 10.
+This is normal DADA2 behavior near the error-model noise floor (R `learnErrors`
+does the same) — the iter-6 vs iter-10 model differs by ~1e-5, far below the
+~1e-3 that affects ASV calls. The iteration counts are **non-monotonic in k**
+(R1: 6/6/7/6; R2: 10/7/6/7), confirming this is run-to-run oscillation, not a
+k effect — it is NOT evidence for k=6 over k=5 on correctness grounds.
+
+### Findings at full scale
+
+- **k's ASV impact stays minimal and non-monotonic**: R1 range 2514–2529 (15
+  ASVs, 0.6 %); R2 range 1991–2016 (25 ASVs, 1.3 %). Holds across ~0.5 billion
+  alignments — far larger than the original single-sample test.
+- **Benign shrouding confirmed at scale**: shroud % climbs 43 → 48 % from k5→k8
+  on both reads, yet ASV counts barely move — the screen removes pairs the
+  alignment would not have clustered, not real variants.
+- **The k=8 wall-time penalty is dramatic**: ~2.6× slower than k=6 (R1 617 s vs
+  182 s; R2 538 s vs 138 s) despite *fewer* iterations — the 4⁸ = 65536-long
+  k-mer dot product dominates. k=6 is fastest on both reads.
+- **Per-iteration screen behavior** (from the learn logs): the first pass of
+  every per-sample `dada` run is unscreened (`kdist_cutoff = 1.0`, by design, to
+  seed cluster 0 — see `run_dada` in `dada.rs`), so it shows `0 shrouded` and
+  fewer alignments; screening (and shrouding) kicks in only once clusters bud in
+  later passes. This matches R DADA2's C++ and is not a bug.
+
+### Open question still not closed
+
+The slight ASV *increase* at higher k on R2 (k7=2015, k8=2016 vs k5=1991, +24–25
+ASVs) is the one thing counts alone can't explain: are those extra ASVs real rare
+close-variants the larger-k screen lets through, or borderline noise? Resolving
+this needs an ASV-set *diff* (sequence-level), not just totals — pending.
+
+### Conclusion (unchanged, now with large-N support)
+
+k=5 stays the safe global default; **k=6 is the practical pick for speed/memory**
+(fastest, lowest non-default footprint) with no ASV downside; k≥7 buys nothing on
+Illumina and costs heavily at k=8. The recommendation is now backed by a 61-sample
+pooled run, not a single sample.
