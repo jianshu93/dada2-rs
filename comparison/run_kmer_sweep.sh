@@ -288,7 +288,7 @@ run_timed() {
 }
 
 SUMMARY_CSV="${OUTDIR}/summary.csv"
-echo "k,learn_iters,dada_aligns,dada_shrouded,shroud_pct,n_asv_total,wall_s_dada,maxrss_kb_dada" > "$SUMMARY_CSV"
+echo "k,threads,learn_iters,dada_aligns,dada_shrouded,shroud_pct,n_asv_total,wall_s_dada,maxrss_kb_dada" > "$SUMMARY_CSV"
 
 for k in $KLIST; do
     echo ""
@@ -332,10 +332,10 @@ done
 # (pooled mode writes one JSON per sample, each containing only that sample's
 # ASVs; the union is the full pooled ASV catalogue).
 # ---------------------------------------------------------------------------
-python3 - "$OUTDIR" "$SUMMARY_CSV" "$KLIST" <<'PY'
+python3 - "$OUTDIR" "$SUMMARY_CSV" "$KLIST" "$THREADS" <<'PY'
 import json, os, re, sys, glob
 
-outdir, csv_path, klist = sys.argv[1], sys.argv[2], sys.argv[3].split()
+outdir, csv_path, klist, threads = sys.argv[1], sys.argv[2], sys.argv[3].split(), sys.argv[4]
 
 def asvs_from_file(path):
     """Set of ASV sequences from one dada output JSON (schema-tolerant)."""
@@ -441,17 +441,17 @@ for k in klist:
     asvs = pooled_asvs(k)
     asv_sets[k] = asvs
     pct = f"{100*shrouded/(aligns+shrouded):.1f}" if (aligns+shrouded) else ""
-    rows.append((k, iters, aligns, shrouded, pct, len(asvs), wall, rss))
+    rows.append((k, threads, iters, aligns, shrouded, pct, len(asvs), wall, rss))
 
 with open(csv_path, "w") as fh:
-    fh.write("k,learn_iters,dada_aligns,dada_shrouded,shroud_pct,n_asv_total,wall_s_dada,maxrss_kb_dada\n")
+    fh.write("k,threads,learn_iters,dada_aligns,dada_shrouded,shroud_pct,n_asv_total,wall_s_dada,maxrss_kb_dada\n")
     for r in rows:
         fh.write(",".join(str(x) for x in r) + "\n")
 
-print("\n================  SUMMARY  ================")
+print(f"\n================  SUMMARY  (threads={threads})  ================")
 hdr = f"{'k':>3} {'iters':>5} {'aligns':>10} {'shroud':>10} {'shroud%':>7} {'#ASV':>6} {'wall_s':>8} {'RSS_MB':>7}"
 print(hdr); print("-"*len(hdr))
-for k, iters, aligns, shrouded, pct, n_asv, wall, rss in rows:
+for k, thr, iters, aligns, shrouded, pct, n_asv, wall, rss in rows:
     rss_mb = f"{int(rss)/1024:.0f}" if rss else ""
     print(f"{k:>3} {iters:>5} {aligns:>10} {shrouded:>10} {pct:>7} {n_asv:>6} {wall:>8} {rss_mb:>7}")
 
