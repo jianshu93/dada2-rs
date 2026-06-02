@@ -65,7 +65,7 @@ struct SampleCounts {
 /// Parse one JSON file.  Returns one `SampleCounts` per sample found.
 ///
 /// Dispatches on the `dada2_rs_command` tag:
-/// * `"dada"` → single-sample dada output
+/// * `"dada"` / `"dada-pooled"` → single-sample dada output (same schema)
 /// * `"merge-pairs"` → multi-sample merge-pairs output (a `samples` array)
 fn parse_file(path: &Path, sample_name: Option<&str>) -> io::Result<Vec<SampleCounts>> {
     let bytes = fs::read(path)?;
@@ -79,7 +79,7 @@ fn parse_file(path: &Path, sample_name: Option<&str>) -> io::Result<Vec<SampleCo
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "{}: missing dada2_rs_command tag (expected 'dada' or 'merge-pairs')",
+                    "{}: missing dada2_rs_command tag (expected 'dada', 'dada-pooled', or 'merge-pairs')",
                     path.display()
                 ),
             )
@@ -87,7 +87,9 @@ fn parse_file(path: &Path, sample_name: Option<&str>) -> io::Result<Vec<SampleCo
         .to_owned();
 
     match cmd.as_str() {
-        "dada" => {
+        // "dada-pooled" emits the same per-sample DadaOutput schema as "dada";
+        // only the tag differs (it records pooling mode). Accept both.
+        "dada" | "dada-pooled" => {
             let out: DadaOutput = serde_json::from_value(value)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             let name = sample_name
@@ -125,7 +127,7 @@ fn parse_file(path: &Path, sample_name: Option<&str>) -> io::Result<Vec<SampleCo
         other => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "{}: dada2_rs_command={other:?}, expected 'dada' or 'merge-pairs'",
+                "{}: dada2_rs_command={other:?}, expected 'dada', 'dada-pooled', or 'merge-pairs'",
                 path.display()
             ),
         )),

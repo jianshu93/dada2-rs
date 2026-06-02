@@ -159,6 +159,11 @@ struct DadaRunParams {
     kdist_cutoff: f64,
     kmer_size: usize,
     use_kmers: bool,
+    /// Denoising mode: false = independent per-sample (`dada`), true = full
+    /// pooling across samples (`dada-pooled`, R DADA2 pool=TRUE).
+    pool: bool,
+    /// Number of unique input sequences flagged as priors (0 when no `--prior`).
+    n_prior: usize,
 }
 
 fn main() -> io::Result<()> {
@@ -779,6 +784,8 @@ fn main() -> io::Result<()> {
                     kdist_cutoff,
                     kmer_size,
                     use_kmers,
+                    pool: false,
+                    n_prior: raw_inputs.iter().filter(|r| r.prior).count(),
                 },
                 map: result.map,
                 aux: aux_json,
@@ -1109,6 +1116,8 @@ fn main() -> io::Result<()> {
                 kdist_cutoff,
                 kmer_size,
                 use_kmers,
+                pool: true,
+                n_prior: raw_inputs.iter().filter(|r| r.prior).count(),
             };
 
             for (s, sample_name) in sample_names.iter().enumerate() {
@@ -1174,7 +1183,7 @@ fn main() -> io::Result<()> {
                     map,
                 };
 
-                let tagged = Tagged::new("dada", out);
+                let tagged = Tagged::new("dada-pooled", out);
                 let json = if compact {
                     serde_json::to_string(&tagged)
                 } else {
