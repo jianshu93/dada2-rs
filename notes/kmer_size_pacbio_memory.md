@@ -138,10 +138,13 @@ infeasible at k ≥ 7.
 2. **k=5 wastes the screen on long reads** — ~0 % shrouded means every pair is
    aligned, making k=5 the slowest PacBio config (dramatically so at scale — see
    below).
-3. **k=6+ engage the screen**, give identical ASVs/error model, and run far
-   faster than k=5. At single-subsample scale the per-k times above are noisy and
-   close; at full scale (below) k=7 is fastest and k=6 is the memory-conscious
-   pick — the choice is a memory↔speed tradeoff, not a clean win on both.
+3. **k=6+ engage the screen**, give identical ASV *counts* (87) and error model
+   here, and run far faster than k=5. (Caveat: only counts were checked at this
+   subsample — the full Illumina run later showed stable counts can hide real
+   set-level churn, so "identical ASVs" is not established for PacBio.) At
+   single-subsample scale the per-k times above are noisy and close; at full
+   scale (below) k=7 is fastest and k=6 is the memory-conscious pick — a
+   memory↔speed tradeoff, not a clean win on both.
 4. **Memory still grows 4× per step** (k=6 ≈ 120 MiB, k=7 ≈ 470 MiB, k=8 ≈ 1.9 GiB
    on a full sample). This is the one axis where higher k is strictly worse.
 
@@ -202,36 +205,82 @@ does the same) — the iter-6 vs iter-10 model differs by ~1e-5, far below the
 (R1: 6/6/7/6; R2: 10/7/6/7), confirming this is run-to-run oscillation, not a
 k effect — it is NOT evidence for k=6 over k=5 on correctness grounds.
 
-### Findings at full scale
+### Measured peak RSS + ASV-set diff (24-thread rerun, 2026-06-01)
 
-- **k's ASV impact stays minimal and non-monotonic**: R1 range 2514–2529 (15
-  ASVs, 0.6 %); R2 range 1991–2016 (25 ASVs, 1.3 %). Holds across ~0.5 billion
-  alignments — far larger than the original single-sample test.
-- **Benign shrouding confirmed at scale**: shroud % climbs 43 → 48 % from k5→k8
-  on both reads, yet ASV counts barely move — the screen removes pairs the
-  alignment would not have clustered, not real variants.
-- **The k=8 wall-time penalty is dramatic**: ~2.6× slower than k=6 (R1 617 s vs
-  182 s; R2 538 s vs 138 s) despite *fewer* iterations — the 4⁸ = 65536-long
-  k-mer dot product dominates. k=6 is fastest on both reads.
+A second rerun at **24 threads** added measured peak RSS (via `/proc` VmHWM —
+this cluster has no `/usr/bin/time`) and a **sequence-level pooled ASV-set diff**
+vs k=5. Aligns/shroud/ASV-counts reproduce the table above; new columns:
+
+**R1** (baseline k=5 = 2514 ASVs):
+
+| k | #ASV | wall (s) | RSS (GB) | shared | only_k5 | only_kN | verdict |
+|---|------|----------|----------|--------|---------|---------|---------|
+| 5 | 2514 | 288.2 |  4.1 | —    | —  | —  | — |
+| 6 | 2529 | 218.0 |  6.5 | 2502 | 12 | 27 | DIFFERS |
+| 7 | 2525 | 211.7 | 16.1 | 2495 | 19 | 30 | DIFFERS |
+| 8 | 2520 | 444.3 | 54.4 | 2486 | 28 | 34 | DIFFERS |
+
+**R2** (baseline k=5 = 1991 ASVs):
+
+| k | #ASV | wall (s) | RSS (GB) | shared | only_k5 | only_kN | verdict |
+|---|------|----------|----------|--------|---------|---------|---------|
+| 5 | 1991 | 204.5 |  3.3 | —    | —  | —  | — |
+| 6 | 2004 | 158.9 |  5.9 | 1975 | 16 | 29 | DIFFERS |
+| 7 | 2015 | 181.8 | 16.3 | 1968 | 23 | 47 | DIFFERS |
+| 8 | 2016 | 392.6 | 58.1 | 1962 | 29 | 54 | DIFFERS |
+
+### Findings at full scale — REVISED
+
+- **Stable ASV *counts* hid real set *churn*. The earlier "identical / washes
+  out" claim was wrong for Illumina at scale.** Counts move only ~0.6–1.3 %, but
+  the underlying ASV *sets* differ from k=5 at every higher k, and the churn is
+  **bidirectional and monotone in k**: higher k both drops some k5 ASVs
+  (`only_k5`: 12→19→28 on R1) and adds new ones (`only_kN`: 27→30→34). R2 is
+  larger (`only_kN` up to 54 at k8).
+- **The churn is the predicted false-negative effect, now observed.** `only_kN >
+  only_k5` consistently and the gap widens with k: more shrouding → genuinely
+  similar sequences that k5 would have aligned-and-clustered escape the screen
+  and split off as their own (mostly rare) ASVs. Higher k slightly **fragments**
+  clustering rather than improving it. Magnitude is small (≤1.4 % of ASVs) and
+  expected to be concentrated in low-abundance variants — *abundance
+  stratification of the churned sets is pending* (see open items).
+- **Measured RSS confirms the 4^k model and is the decisive cost.** ~3.3 GB
+  k-independent base + 4^k k-mer vectors: 4→6.5→16→**54 GB** (R1), 3.3→5.9→16→
+  **58 GB** (R2). k=8 is operationally prohibitive on typical nodes; even k=7 is
+  ~16 GB. The 24-thread per-worker buffer term is negligible for 250 bp reads, so
+  RSS is essentially all k-mer vectors.
+- **Wall time** (24 threads): k=7 fastest (R1 212 s, R2 182 s), k=8 slowest by
+  far (R1 444 s, R2 393 s). Matches the earlier full run's *ordering*; absolute
+  values differ with thread count (now recorded in the CSV `threads` column).
 - **Per-iteration screen behavior** (from the learn logs): the first pass of
   every per-sample `dada` run is unscreened (`kdist_cutoff = 1.0`, by design, to
   seed cluster 0 — see `run_dada` in `dada.rs`), so it shows `0 shrouded` and
-  fewer alignments; screening (and shrouding) kicks in only once clusters bud in
-  later passes. This matches R DADA2's C++ and is not a bug.
+  fewer alignments; screening kicks in only once clusters bud. Matches R DADA2's
+  C++; not a bug.
+- **R2/k5 hitting max-consist 10** is error-model oscillation, not slow
+  convergence or a k effect (see the `*` note above).
 
-### Open question still not closed
+### Open items
 
-The slight ASV *increase* at higher k on R2 (k7=2015, k8=2016 vs k5=1991, +24–25
-ASVs) is the one thing counts alone can't explain: are those extra ASVs real rare
-close-variants the larger-k screen lets through, or borderline noise? Resolving
-this needs an ASV-set *diff* (sequence-level), not just totals — pending.
+1. **Abundance-stratify the churned ASVs** (`only_k5` and `only_kN` sets): are
+   they singletons/low-count noise (ignorable) or do any carry real abundance
+   (concerning)? Decides real-variant-vs-noise. Needs per-ASV abundance from the
+   `dada_k*/` JSONs.
+2. **Does the per-orientation churn survive merging?** The 2-sample k5/k6 merge
+   test came out IDENTICAL, but that was tiny and only k5/k6. With this larger
+   churn (esp. R2 k7/k8) the merge-level question is live — run the documented
+   merge across the full set and diff merged ASVs across k.
 
-### Conclusion (unchanged, now with large-N support)
+### Conclusion — REVISED (still: k=5 default, now better justified for Illumina)
 
-k=5 stays the safe global default; **k=6 is the practical pick for speed/memory**
-(fastest, lowest non-default footprint) with no ASV downside; k≥7 buys nothing on
-Illumina and costs heavily at k=8. The recommendation is now backed by a 61-sample
-pooled run, not a single sample.
+For **Illumina**, raising k above 5 now has **three** documented costs and no
+benefit: (a) ASV-set churn that fragments rare variants (~0.5–1.4 %, growing with
+k), (b) steep memory (16 GB at k7, ~55 GB at k8 on a 61-sample pool), and (c) the
+screen already works fine at k5 (43 % shroud). **Keep k=5 for short reads** — the
+case is now *stronger*, not "no downside" as previously written. The k=6/k=7
+speed advantage is real but does not justify the churn + memory on short reads
+where k=5 is already fast enough. (This is the opposite tradeoff from PacBio,
+where k=5 is a no-op and raising k is necessary — see the scale section below.)
 
 ---
 
@@ -326,11 +375,16 @@ k=6  merged_ASVs=144  merge_rate=0.955  (11631/12177)
   k=6 vs k=5: shared=144 only_k5=0 only_k6=0  [IDENTICAL]
 ```
 
-The merged amplicon set is **identical** and the merge rate is unchanged, even
-though k can nudge the pre-merge R1/R2 ASV counts. So on this data the upstream
-k-sensitivity washes out completely after merging — pairing is robust to the
-k-mer-screen size. (Worth repeating on the full 61-sample set and across k=7/8 to
-confirm, but the 2-sample result is a strong indicator.)
+The merged amplicon set is identical and the merge rate is unchanged for these
+**2 samples at k=5/k=6**.
+
+> **Do not over-read this.** The full 61-sample sweep (above) shows the
+> per-orientation ASV *sets* DO churn vs k=5 (R1/R2 "DIFFERS" at every higher k,
+> growing to `only_k8`≈34–54), even though counts are stable. The 2-sample
+> k5/k6 merge happened to be too small (and too low-k) to surface that. Whether
+> the larger full-scale churn collapses after merging is **open** — it must be
+> checked on the full 61-sample set across k=5–8 (open item #2 above), not
+> inferred from this toy example.
 
 ---
 
@@ -352,9 +406,12 @@ above.
 - **k=5 is a no-op screen on long reads, confirmed at scale**: 0.9 % shrouded of
   757M comparisons. The 1024-entry k=5 vectors can't discriminate 1.4 kb reads,
   so nearly every pair gets a full O(L²) alignment.
-- **ASV impact is negligible**: 2884 → 2893, a monotonic **+9 (0.3 %)** across
-  k5→k8 — even smaller than the Illumina spread. Benign shrouding holds at scale
-  (shroud % 0.9 → 48 % while ASVs barely move).
+- **ASV *count* impact is negligible**: 2884 → 2893, a monotonic **+9 (0.3 %)**
+  across k5→k8 — even smaller than the Illumina spread. NOTE: this is **counts
+  only** — no sequence-level set-diff was run for PacBio. The Illumina full run
+  (above) showed stable counts can hide real bidirectional ASV-set churn, so do
+  NOT assume the PacBio sets are identical across k. A pooled ASV-set diff (like
+  the Illumina one) is an open item for PacBio too.
 - **Timing inverts vs the subsample.** At real scale **k=5 is catastrophically
   slow** (~4140 s, ~4–5× everything else) because it aligns nearly all 757M pairs.
   **k=7 is the fastest (749 s); k=8 (868 s) beats k=6 (988 s).** The screen's
