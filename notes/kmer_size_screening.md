@@ -365,27 +365,70 @@ abundance/co-occurrence-driven *within each table*, so the ~12 residual mixes
 "churn removed" with "slightly different ASVs flagged chimeric per k" — but at
 12/733 it is noise.)
 
+### PacBio churn cascade — ANSWERED (2026-06-02, 95-sample pacbio_sweep)
+
+Applied the full Illumina treatment to PacBio (`data/pacbio/pacbio_sweep`:
+per-k `dada_k*/`, `raw-seqtable/seqtab.raw.k*.json`, `remove-bimera-denovo/
+seqtab.nonchim.k*.json`; 95 samples, single-end so no merge step). Cascade
+(k8 vs k5):
+
+| stage | churn |
+|-------|-------|
+| raw pooled ASVs | 37 (only_k5=14, only_k8=23) |
+| **after chimera removal** | **6** (only_k5=2, only_k8=4) |
+
+Final tables ~99.7 % identical across k5→k8 (≈6–10 residual of ~2132). Chimera
+removal absorbs **31 of 37 (84 %)** of the raw churn — same collapse as Illumina.
+
+- **Mechanism = same benign fragmentation**: all 23 `only_k8` raw ASVs are
+  `birth_type=Abundance`; top ones trace to low-Hamming k5 parents (several
+  exactly Hamming-1, e.g. ab=80 from a 52-read parent; ab=41 from 127).
+- **BUT PacBio churn is more abundance-weighted than Illumina's**: only 4/23
+  `only_k8` ASVs are <10 reads (median 17, **max 375**), vs Illumina's
+  ~one-third-below-10. Long-read fragments carry more reads.
+- **The one real exception worth noting**: of the 11 abundant (≥20-read)
+  `only_k8` ASVs, chimera removal absorbs 10 — but **one survives into the final
+  table**: a **375-read ASV, Hamming-3 from a 909-read k5 parent**. This is a
+  single moderately-abundant amplicon whose presence in the final PacBio table
+  *genuinely depends on the k-mer screen size*. Plausibly a real close variant
+  k=5's loose screen merged away, or an artifact chimera detection missed — not
+  disambiguable from these files. At 375 reads it *could* affect a downstream
+  call. So PacBio's residual is slightly less purely-benign than Illumina's,
+  though still ~0.3–0.5 % of the final table.
+
 ### Open items (remaining)
 
-1. **PacBio set-diff + abundance stratification** — PacBio only had a count check
-   (+9); apply the same trace to confirm its churn is the same benign
-   fragmentation. (Data available: PacBio k-mer sweeps.)
+- None blocking. Optional: disambiguate the single surviving 375-read PacBio
+  `only_k8` ASV (real variant vs missed artifact) — would need reference
+  alignment / taxonomy, outside the JSON-trace scope.
 
-### Conclusion — REVISED (k=5 default; k has ~no effect on the final Illumina table)
+### Conclusion — k has ~no effect on the final feature table, BOTH platforms
 
-The decisive finding: **k-mer screen size has essentially no effect on the final,
-chimera-filtered Illumina feature table** (~98 % identical k5→k8; ~12 of 733
-residual). The intermediate ASV churn (145 per-orientation → 67 merged → ~12
-post-chimera) cascades away at each downstream step, and chimera removal absorbs
-90 % of what survived merging.
+The decisive finding, now confirmed on **both** platforms: **k-mer screen size has
+essentially no effect on the final, chimera-filtered feature table.** Intermediate
+ASV churn cascades away at every downstream step:
 
-So for **Illumina** there is no accuracy reason to raise k, and three costs if you
-do: (a) intermediate ASV-set churn (mostly benign fragmentation, washed out by the
-final table anyway), (b) steep memory (16 GB at k7, ~55 GB at k8 on the 61-sample
-pool), (c) the screen already works fine at k5 (43 % shroud). **Keep k=5 for short
-reads.** The k=6/k=7 speed edge does not justify the memory on short reads where
-k=5 is already fast enough. (Opposite tradeoff from PacBio, where k=5 is a no-op
-and raising k is necessary for speed — see the scale section.)
+| platform | per-orientation | merged | post-chimera (final) | final identity |
+|----------|-----------------|--------|----------------------|----------------|
+| Illumina (k8 vs k5) | 145 | 67 | ~12 of 733 | ~98 % |
+| PacBio (k8 vs k5)   | 37 (raw, single-end) | — | ~6 of 2132 | ~99.7 % |
+
+Chimera removal is the dominant filter (absorbs ~84–90 % of pre-chimera churn) —
+fragmentation products are textbook bimera candidates. **One PacBio exception**: a
+single ~375-read `only_k8` amplicon (Hamming-3 from a 909-read k5 parent) survives
+to the final table, so on long reads the screen size can, rarely, change one
+moderately-abundant call. Otherwise the final tables are k-invariant.
+
+**Recommendations:**
+- **Illumina (short reads): keep k=5.** No accuracy reason to raise it (final table
+  is k-invariant), and three costs if you do — intermediate churn, steep memory
+  (16 GB @ k7, ~55 GB @ k8 on the 61-sample pool), and the screen already works at
+  k5 (43 % shroud). The k=6/k=7 speed edge doesn't justify the memory when k=5 is
+  already fast enough.
+- **PacBio (long reads): do NOT use k=5** — there the screen is a no-op (0.9 %
+  shroud) so denoising is ~4–5× slower; **k=7 for speed or k=6 to cap memory**.
+  The final table is ~k-invariant regardless (the one 375-read exception aside),
+  so choose on speed/memory, not accuracy.
 
 ---
 
