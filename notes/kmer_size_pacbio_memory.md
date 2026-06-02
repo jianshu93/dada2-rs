@@ -56,7 +56,13 @@ across all k. MiSeq used its full 2014 uniques.
 | 7 | 4 | 1.57 | 132.3 MiB | 2.06e-3 |
 | 8 | 4 | 2.56 | 416.9 MiB | 4.35e-3 |
 
-### PacBio SRR28724909 (HiFi, ~1450 bp; pacbio, band 32)
+### PacBio SRR28724909 (HiFi, ~1450 bp; pacbio, band 32) — single subsampled sample
+
+> **Superseded timing:** the wall times in this single-sample table (and the
+> "k=8 ~2× slower than k=6" claim derived from them) are a **small-sample
+> artifact**. At full scale the ordering inverts — see "Full PacBio sweep at
+> scale" below, where k=5 is by far the slowest and k=7 is fastest. The ASV /
+> shroud / memory findings here all still hold.
 
 | k | iters | wall (s) | peak RSS | err_out max\|Δ\| vs k5 |
 |---|-------|----------|----------|------------------------|
@@ -129,22 +135,28 @@ infeasible at k ≥ 7.
    iterations, produced 87 ASVs, and learned the same error model (~1e-7
    agreement). The #15 worry about false-rejecting valid pairs did not
    materialize: even at 78.9 % shrouding the result was unchanged.
-2. **k=5 wastes the screen on long reads** — 0 % shrouded means every pair is
-   aligned, making k=5 the slowest PacBio config (~4× slower than k=6).
-3. **k=6 is the PacBio sweet spot**: the screen engages (≈4× speedup over k=5),
-   results are identical, and memory is only ~120 MiB on a full sample.
-4. **k=7/k=8 add memory (4× per step) with no benefit** over k=6 here, and their
-   aggressive shrouding is a latent false-negative risk on harder data.
+2. **k=5 wastes the screen on long reads** — ~0 % shrouded means every pair is
+   aligned, making k=5 the slowest PacBio config (dramatically so at scale — see
+   below).
+3. **k=6+ engage the screen**, give identical ASVs/error model, and run far
+   faster than k=5. At single-subsample scale the per-k times above are noisy and
+   close; at full scale (below) k=7 is fastest and k=6 is the memory-conscious
+   pick — the choice is a memory↔speed tradeoff, not a clean win on both.
+4. **Memory still grows 4× per step** (k=6 ≈ 120 MiB, k=7 ≈ 470 MiB, k=8 ≈ 1.9 GiB
+   on a full sample). This is the one axis where higher k is strictly worse.
 
-## Recommendation
+> NOTE: the original recommendation here (k=6 as a clean speed+memory "sweet
+> spot") rested partly on the small-sample timing that the full-scale run below
+> overturns. The revised recommendation is in "Full PacBio sweep at scale".
+
+## Recommendation (see the scale section below for the current PacBio call)
 
 - Keep **k=5 as the global default** (correct and lowest-memory for short reads,
   where the screen does discriminate — see `benchmark_kmer_size.md`).
-- For **PacBio HiFi, use k=6**: same ASVs and error model as k=5, ~4× faster, and
-  far cheaper than k≥7. Document k=6 in the `--kmer-size` help for `--errfun
-  pacbio`, mirroring the per-errfun guidance added for `--loess-*`.
-- Avoid k ≥ 7 for HiFi, especially pooled or large-N runs (memory + benign-but-
-  aggressive shrouding with no upside).
+- For **PacBio HiFi, raise k above 5** — k=5 leaves the screen a no-op on long
+  reads (huge alignment cost). Choose **k=7 for speed** or **k=6 to cap memory**;
+  see the scale section for the measured tradeoff. Document this in the
+  `--kmer-size` help for `--errfun pacbio`.
 
 ### Caveats
 
@@ -319,3 +331,52 @@ though k can nudge the pre-merge R1/R2 ASV counts. So on this data the upstream
 k-sensitivity washes out completely after merging — pairing is robust to the
 k-mer-screen size. (Worth repeating on the full 61-sample set and across k=7/8 to
 confirm, but the 2-sample result is a strong indicator.)
+
+---
+
+## Full PacBio sweep at scale (2026-06-01) — timing inverts vs the subsample
+
+A full-scale PacBio HiFi sweep (pacbio errfun, band 32, ~757M comparisons per k)
+gives the cleanest picture yet and **overturns the small-sample timing** noted
+above.
+
+| k | learn_iters | dada_aligns | dada_shrouded | shroud % | n_asv | wall (s) |
+|---|------------|-------------|---------------|----------|-------|----------|
+| 5 | 6 | 756 825 650 |   7 093 737 |  0.9 | 2884 | 4139.6 |
+| 6 | 6 | 757 313 016 | 608 639 940 | 44.6 | 2886 |  988.4 |
+| 7 | 6 | 758 598 363 | 667 401 347 | 46.8 | 2891 |  749.2 |
+| 8 | 5 | 759 208 148 | 700 398 319 | 48.0 | 2893 |  868.2 |
+
+### Findings
+
+- **k=5 is a no-op screen on long reads, confirmed at scale**: 0.9 % shrouded of
+  757M comparisons. The 1024-entry k=5 vectors can't discriminate 1.4 kb reads,
+  so nearly every pair gets a full O(L²) alignment.
+- **ASV impact is negligible**: 2884 → 2893, a monotonic **+9 (0.3 %)** across
+  k5→k8 — even smaller than the Illumina spread. Benign shrouding holds at scale
+  (shroud % 0.9 → 48 % while ASVs barely move).
+- **Timing inverts vs the subsample.** At real scale **k=5 is catastrophically
+  slow** (~4140 s, ~4–5× everything else) because it aligns nearly all 757M pairs.
+  **k=7 is the fastest (749 s); k=8 (868 s) beats k=6 (988 s).** The screen's
+  savings (skipping long-read alignments) dominate the cost of the longer k-mer
+  dot product — the opposite of the tiny-subsample result, where alignment cost
+  was too small to dominate and k=8 looked ~2× slower than k=6. **Treat the
+  subsample timing as an artifact; this scale ordering is the real one.**
+- `maxrss_kb` is blank: the cluster lacks `/usr/bin/time`/`gtime`, so RSS wasn't
+  captured (wall time is, via the bash-clock fallback). Memory comparison for
+  this run therefore relies on the 4^k model (k6 ≈ 120 MiB, k7 ≈ 470 MiB,
+  k8 ≈ 1.9 GiB on a full sample). **TODO: re-run with GNU `time`/`gtime` on the
+  cluster to get measured peak RSS — memory is now the *sole* remaining argument
+  for k=6 over k=7, so a measured number would settle the tradeoff.**
+
+### Revised PacBio recommendation
+
+- **Do not use k=5 for PacBio HiFi** — the screen is a no-op on long reads and the
+  full alignment load makes it ~4–5× slower than any k≥6, with no ASV benefit.
+- **k=7 for speed** (fastest at scale, ~749 s) **or k=6 to cap memory** (~120 MiB
+  vs k=7's ~470 MiB, at ~76 % of the speed win over k=5). It is a genuine
+  memory↔speed tradeoff; both give effectively identical ASVs (±9 across the
+  whole k=5–8 range). k=8 has no advantage over k=7 (slower *and* 4× the memory).
+- k=5 remains the safe global *default* for short Illumina reads, where the
+  screen does discriminate; the above applies specifically to long-read
+  (`--errfun pacbio`) runs.
