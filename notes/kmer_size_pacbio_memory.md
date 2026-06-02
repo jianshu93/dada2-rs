@@ -437,3 +437,67 @@ above.
 - k=5 remains the safe global *default* for short Illumina reads, where the
   screen does discriminate; the above applies specifically to long-read
   (`--errfun pacbio`) runs.
+
+---
+
+## ASV lineage tracing through the JSON artifacts (feasibility map, 2026-06-02)
+
+To diagnose *why* specific ASVs churn across k (open item #1), we need to trace a
+final sequence back through the pipeline. This maps how far that's possible using
+**only the JSON files we already emit** (scope: derep → dada → merge-pairs for
+paired Illumina; derep → dada for single-end PacBio). Verified against both the
+Rust output structs and real files in `data/illumina/full-pooling/`.
+
+### What each artifact exposes for linking
+
+| Artifact | Linking key(s) | Notes |
+|----------|----------------|-------|
+| **derep** (`*.derep.R*.json`) | unique **sequence string**; unique **positional index** (abundance-desc) | read→unique `map` is gated behind `--show-map` and is **absent** by default |
+| **dada** (`<sample>.json`) | ASV **sequence**; ASV **index** into `asvs[]` (cluster order); **`map`** = derep-unique-index → ASV-index (always emitted); per-ASV `birth_type`/`birth_pval`/`birth_fold`/`birth_e` | `null` in `map` = unique dropped at `omega_c` |
+| **seqtab** (`seqtab.R*.json`) | sequence **hash** (md5/sha1) + per-sample counts | keyed by sequence string only; not referenced by derep/dada/merge — a convenient ID that currently threads nowhere |
+| **merge-pairs** (`merged_pairs.json`) | merged **sequence**; `forward`/`reverse` = **positional indices** into that sample's fwd/rev dada `asvs[]` | parent ASV sequences are NOT stored, only their indices |
+
+### Net traceable span (today, no code changes)
+
+- **Paired Illumina:** merged amplicon → fwd & rev **dada ASV** (by index) → **set
+  of derep unique sequences** per direction (via the dada `map`). Stops at the
+  unique level.
+- **Single-end PacBio:** dada ASV → **set of derep uniques** (via `map`). Stops there.
+
+**Verified end-to-end** on F3D0_S188: top merged amplicon (`forward=0`) → R1
+`asvs[0]` (abund 538) → inverting the dada `map` gave **66 derep uniques summing
+to exactly 538**. Exact reconciliation — the trace works.
+
+### Break points (in priority order)
+
+1. **Read level is severed.** The dada `map` keys on derep *unique* index, not
+   *read*; the derep read→unique `map` is not emitted by default. Provenance
+   bottoms out at the unique sequence, never the individual read. (Same single
+   break for PacBio.)
+2. **merge-pairs doesn't persist its read→(fwd,rev) composition** — it
+   re-dereplicates the filtered FASTQ at runtime and stores only aggregated
+   indices + abundance.
+3. **All cross-stage links above the unique level are positional, not
+   sequence-based** (`merge.forward`→`asvs[i]`; dada `map`→unique index). Robust
+   only if every file is the same sample in its original emitted order; nothing
+   embedded makes the join self-validating.
+4. **No stable global ID threads the chain** — seqtab's hash exists but is
+   referenced nowhere upstream/downstream.
+
+### Implication for the churn diagnosis
+
+Enough exists **today** to diagnose churn without new instrumentation, via a
+**sequence-keyed** trace: find an `only_in_kN` ASV by its sequence in the kN dada
+JSON → invert that file's `map` to its derep uniques → look those same unique
+sequences up in the k5 dada `map` to see which ASV(s) they landed in there. That
+directly tests the fragmentation hypothesis (did kN split a cluster k5 had
+merged?), and `birth_*` speaks to the convergence-difference theory. Attribution
+is to uniques, not reads — which is the right granularity for denoising anyway.
+
+### Possible future enhancement (NOT yet implemented)
+
+Carry the **seqtab-style sequence hash into the dada and merge-pairs outputs** (and
+optionally alongside dada `map` entries). This converts the fragile positional
+joins into stable hash joins, making lineage tracing turnkey and self-validating
+instead of order-dependent. Low effort, no algorithmic change; deferred until
+there's demand for routine tracing.
