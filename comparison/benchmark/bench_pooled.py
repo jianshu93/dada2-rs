@@ -51,8 +51,7 @@ import sys
 import time
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
-REPO = HERE.parent.parent   # comparison/benchmark/ -> repo root
+HERE = Path(__file__).resolve().parent   # R helper scripts live alongside this file
 
 R_STEPS = {
     "illumina": ["filter", "learn_fwd", "learn_rev", "dada_fwd", "dada_rev",
