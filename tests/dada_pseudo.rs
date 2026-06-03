@@ -14,6 +14,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 const BIN: &str = env!("CARGO_BIN_EXE_dada2-rs");
 
@@ -83,27 +84,36 @@ fn fasta_seqs(path: &Path) -> BTreeSet<String> {
         .collect()
 }
 
-/// Learn a small loess error model from the two committed forward fixtures.
-fn learn_errors(dir: &Path) -> PathBuf {
-    let err = dir.join("err.json");
-    run(&[
-        "learn-errors",
-        fixture("sam1F.fastq.gz").to_str().unwrap(),
-        fixture("sam2F.fastq.gz").to_str().unwrap(),
-        "--errfun",
-        "loess",
-        "--threads",
-        "1",
-        "-o",
-        err.to_str().unwrap(),
-    ]);
-    err
+/// A loess error model learned once from the two committed forward fixtures and
+/// shared across all tests in this binary (learning is the slow step, so doing
+/// it once keeps CI fast). `OnceLock::get_or_init` runs the closure exactly
+/// once even though tests execute on parallel threads.
+fn shared_err_model() -> PathBuf {
+    static ERR: OnceLock<PathBuf> = OnceLock::new();
+    ERR.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("dada2rs_shared_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = dir.join("err.json");
+        run(&[
+            "learn-errors",
+            fixture("sam1F.fastq.gz").to_str().unwrap(),
+            fixture("sam2F.fastq.gz").to_str().unwrap(),
+            "--errfun",
+            "loess",
+            "--threads",
+            "1",
+            "-o",
+            err.to_str().unwrap(),
+        ]);
+        err
+    })
+    .clone()
 }
 
 #[test]
 fn dada_pseudo_matches_manual_recipe() {
     let dir = scratch("pseudo");
-    let err = learn_errors(&dir);
+    let err = shared_err_model();
     let s1 = fixture("sam1F.fastq.gz");
     let s2 = fixture("sam2F.fastq.gz");
 
@@ -200,7 +210,7 @@ fn dada_pseudo_matches_manual_recipe() {
 #[test]
 fn dada_multi_input_matches_per_file_runs() {
     let dir = scratch("multi");
-    let err = learn_errors(&dir);
+    let err = shared_err_model();
     let s1 = fixture("sam1F.fastq.gz");
     let s2 = fixture("sam2F.fastq.gz");
 
@@ -247,7 +257,7 @@ fn dada_input_output_guards() {
     // No error model needed: these must fail during argument validation,
     // before any denoising. We point --error-model at a path that exists so
     // the guard (not a missing-file error) is what trips.
-    let err = learn_errors(&dir);
+    let err = shared_err_model();
 
     // >1 input with -o is rejected.
     let e = run_expect_err(&[
