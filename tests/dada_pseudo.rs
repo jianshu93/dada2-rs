@@ -1,0 +1,274 @@
+//! End-to-end CLI tests for multi-input `dada` and `dada-pseudo`.
+//!
+//! These run the built binary against the committed fixtures in `data/dada2/`
+//! and assert two equivalences that define the new subcommands:
+//!
+//! 1. `dada-pseudo` produces exactly the same per-sample ASVs as the manual
+//!    four-step pseudo-pooling recipe (round-1 `dada` → `make-sequence-table`
+//!    → `seq-table-to-fasta --prevalence 2` → round-2 `dada --prior`).
+//! 2. Multi-input `dada` produces byte-identical per-sample output to running
+//!    single-input `dada` once per file.
+//!
+//! Everything runs with `--threads 1` for determinism.
+
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+const BIN: &str = env!("CARGO_BIN_EXE_dada2-rs");
+
+fn manifest_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn fixture(name: &str) -> PathBuf {
+    manifest_dir().join("data/dada2").join(name)
+}
+
+/// Per-test scratch dir under the target tmp area; cleaned and recreated.
+fn scratch(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("dada2rs_{}_{}", tag, std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// Run the binary; panic with stderr on a non-zero exit.
+fn run(args: &[&str]) {
+    let out = Command::new(BIN)
+        .args(args)
+        .output()
+        .unwrap_or_else(|e| panic!("failed to spawn {BIN}: {e}"));
+    assert!(
+        out.status.success(),
+        "command failed: dada2-rs {}\n--- stderr ---\n{}",
+        args.join(" "),
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
+
+/// Run the binary expecting failure; return stderr.
+fn run_expect_err(args: &[&str]) -> String {
+    let out = Command::new(BIN).args(args).output().unwrap();
+    assert!(
+        !out.status.success(),
+        "expected failure but command succeeded: dada2-rs {}",
+        args.join(" "),
+    );
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+/// Sorted set of (sequence, abundance) from a `dada`/`dada-pseudo` output JSON.
+fn asv_set(path: &Path) -> BTreeSet<(String, i64)> {
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    v["asvs"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no asvs array in {}", path.display()))
+        .iter()
+        .map(|a| {
+            (
+                a["sequence"].as_str().unwrap().to_ascii_uppercase(),
+                a["abundance"].as_i64().unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// Set of (uppercased) sequences in a FASTA file.
+fn fasta_seqs(path: &Path) -> BTreeSet<String> {
+    let text = std::fs::read_to_string(path).unwrap();
+    text.lines()
+        .filter(|l| !l.starts_with('>') && !l.trim().is_empty())
+        .map(|l| l.trim().to_ascii_uppercase())
+        .collect()
+}
+
+/// Learn a small loess error model from the two committed forward fixtures.
+fn learn_errors(dir: &Path) -> PathBuf {
+    let err = dir.join("err.json");
+    run(&[
+        "learn-errors",
+        fixture("sam1F.fastq.gz").to_str().unwrap(),
+        fixture("sam2F.fastq.gz").to_str().unwrap(),
+        "--errfun",
+        "loess",
+        "--threads",
+        "1",
+        "-o",
+        err.to_str().unwrap(),
+    ]);
+    err
+}
+
+#[test]
+fn dada_pseudo_matches_manual_recipe() {
+    let dir = scratch("pseudo");
+    let err = learn_errors(&dir);
+    let s1 = fixture("sam1F.fastq.gz");
+    let s2 = fixture("sam2F.fastq.gz");
+
+    // --- dada-pseudo (one pass) ---
+    let pseudo_out = dir.join("pseudo");
+    let pseudo_priors = dir.join("priors_pseudo.fasta");
+    run(&[
+        "dada-pseudo",
+        s1.to_str().unwrap(),
+        s2.to_str().unwrap(),
+        "--error-model",
+        err.to_str().unwrap(),
+        "--output-dir",
+        pseudo_out.to_str().unwrap(),
+        "--pseudo-prevalence",
+        "2",
+        "--priors-out",
+        pseudo_priors.to_str().unwrap(),
+        "--threads",
+        "1",
+    ]);
+
+    // --- manual recipe ---
+    let r1 = dir.join("r1");
+    let r2 = dir.join("r2");
+    std::fs::create_dir_all(&r1).unwrap();
+    std::fs::create_dir_all(&r2).unwrap();
+    let r1_s1 = r1.join("sam1F.json");
+    let r1_s2 = r1.join("sam2F.json");
+    for (inp, out) in [(&s1, &r1_s1), (&s2, &r1_s2)] {
+        run(&[
+            "dada",
+            inp.to_str().unwrap(),
+            "--error-model",
+            err.to_str().unwrap(),
+            "--threads",
+            "1",
+            "-o",
+            out.to_str().unwrap(),
+        ]);
+    }
+    let seqtab = dir.join("seqtab.json");
+    run(&[
+        "make-sequence-table",
+        r1_s1.to_str().unwrap(),
+        r1_s2.to_str().unwrap(),
+        "-o",
+        seqtab.to_str().unwrap(),
+    ]);
+    let manual_priors = dir.join("priors_manual.fasta");
+    run(&[
+        "seq-table-to-fasta",
+        seqtab.to_str().unwrap(),
+        "--prevalence",
+        "2",
+        "-o",
+        manual_priors.to_str().unwrap(),
+    ]);
+    let r2_s1 = r2.join("sam1F.json");
+    let r2_s2 = r2.join("sam2F.json");
+    for (inp, out) in [(&s1, &r2_s1), (&s2, &r2_s2)] {
+        run(&[
+            "dada",
+            inp.to_str().unwrap(),
+            "--error-model",
+            err.to_str().unwrap(),
+            "--prior",
+            manual_priors.to_str().unwrap(),
+            "--threads",
+            "1",
+            "-o",
+            out.to_str().unwrap(),
+        ]);
+    }
+
+    // --- priors must be the same set ---
+    assert_eq!(
+        fasta_seqs(&pseudo_priors),
+        fasta_seqs(&manual_priors),
+        "selected prior sequences differ between dada-pseudo and the manual recipe",
+    );
+
+    // --- per-sample ASVs must match ---
+    for sample in ["sam1F.json", "sam2F.json"] {
+        let pseudo = asv_set(&pseudo_out.join(sample));
+        let manual = asv_set(&r2.join(sample));
+        assert_eq!(
+            pseudo, manual,
+            "ASV (sequence, abundance) sets differ for {sample}",
+        );
+    }
+}
+
+#[test]
+fn dada_multi_input_matches_per_file_runs() {
+    let dir = scratch("multi");
+    let err = learn_errors(&dir);
+    let s1 = fixture("sam1F.fastq.gz");
+    let s2 = fixture("sam2F.fastq.gz");
+
+    // Multi-input run -> per-sample files in a directory.
+    let multi = dir.join("multi");
+    run(&[
+        "dada",
+        s1.to_str().unwrap(),
+        s2.to_str().unwrap(),
+        "--error-model",
+        err.to_str().unwrap(),
+        "--output-dir",
+        multi.to_str().unwrap(),
+        "--threads",
+        "1",
+    ]);
+
+    // Single-input runs, one per file.
+    for (inp, name) in [(&s1, "sam1F.json"), (&s2, "sam2F.json")] {
+        let single = dir.join(format!("single_{name}"));
+        run(&[
+            "dada",
+            inp.to_str().unwrap(),
+            "--error-model",
+            err.to_str().unwrap(),
+            "--threads",
+            "1",
+            "-o",
+            single.to_str().unwrap(),
+        ]);
+        assert_eq!(
+            std::fs::read(multi.join(name)).unwrap(),
+            std::fs::read(&single).unwrap(),
+            "multi-input output for {name} differs from the single-input run",
+        );
+    }
+}
+
+#[test]
+fn dada_input_output_guards() {
+    let dir = scratch("guards");
+    let s1 = fixture("sam1F.fastq.gz");
+    let s2 = fixture("sam2F.fastq.gz");
+    // No error model needed: these must fail during argument validation,
+    // before any denoising. We point --error-model at a path that exists so
+    // the guard (not a missing-file error) is what trips.
+    let err = learn_errors(&dir);
+
+    // >1 input with -o is rejected.
+    let e = run_expect_err(&[
+        "dada",
+        s1.to_str().unwrap(),
+        s2.to_str().unwrap(),
+        "--error-model",
+        err.to_str().unwrap(),
+        "-o",
+        dir.join("x.json").to_str().unwrap(),
+    ]);
+    assert!(e.contains("--output"), "unexpected error: {e}");
+
+    // Single input with --output-dir is rejected.
+    let e = run_expect_err(&[
+        "dada",
+        s1.to_str().unwrap(),
+        "--error-model",
+        err.to_str().unwrap(),
+        "--output-dir",
+        dir.join("d").to_str().unwrap(),
+    ]);
+    assert!(e.contains("--output-dir"), "unexpected error: {e}");
+}
