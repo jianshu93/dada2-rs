@@ -107,8 +107,13 @@ pub enum Commands {
     /// matrix.  Pass `--use-err-in` to use `err_in` instead.
     #[command(display_order = 8)]
     Dada {
-        /// Input file: FASTQ (uncompressed or gzipped) or a derep/sample JSON.
-        input: PathBuf,
+        /// One or more input files: FASTQ (uncompressed or gzipped) or a
+        /// derep/sample JSON. With a single input the result is written to
+        /// `--output`/`-o` (or stdout). With more than one input the samples are
+        /// processed independently/serially (NOT pooled) and one `{sample}.json`
+        /// per sample is written to `--output-dir` (which is then required).
+        #[arg(required = true)]
+        input: Vec<PathBuf>,
 
         /// JSON error model file produced by the `learn-errors` subcommand
         #[arg(long)]
@@ -241,9 +246,15 @@ pub enum Commands {
         #[arg(long, default_value_t = 1)]
         trace_min_abund: u32,
 
-        /// Write JSON output to this file instead of stdout
+        /// Write JSON output to this file instead of stdout (single input only)
         #[arg(long, short = 'o')]
         output: Option<PathBuf>,
+
+        /// Output directory for per-sample JSON files (required when more than
+        /// one input is given; created if absent). One `{sample}.json` per
+        /// sample, same convention as `dada-pooled`.
+        #[arg(long)]
+        output_dir: Option<PathBuf>,
 
         /// Output compact (minified) JSON instead of pretty-printed
         #[arg(long)]
@@ -362,6 +373,121 @@ pub enum Commands {
         verbose: bool,
     },
 
+    /// Denoise multiple samples with pseudo-pooling (R DADA2 `pool="pseudo"`)
+    ///
+    /// Two per-sample rounds. Round 1 denoises each sample independently (no
+    /// priors). The ASVs from round 1 are pooled into a sequence table and a
+    /// prior set is selected using R DADA2's PSEUDO_PREVALENCE / PSEUDO_ABUNDANCE
+    /// rule (`--pseudo-prevalence` / `--pseudo-min-abundance`). Round 2 re-runs
+    /// each sample with those priors flagged (routed through `--omega-p`). One
+    /// `{sample}.json` per sample is written to `--output-dir`.
+    #[command(display_order = 10)]
+    DadaPseudo {
+        /// One or more input files — FASTQ (.fastq/.fastq.gz) or derep/sample JSON
+        #[arg(required = true)]
+        input: Vec<PathBuf>,
+
+        /// JSON error model file produced by the `learn-errors` subcommand
+        #[arg(long)]
+        error_model: PathBuf,
+
+        /// Use `err_in` from the error model instead of `err_out`
+        #[arg(long)]
+        use_err_in: bool,
+
+        /// Inherit any unspecified algorithm parameters from the error model
+        /// JSON's `params` block. See the `dada` subcommand for full semantics.
+        #[arg(long)]
+        inherit_err_params: bool,
+
+        /// Sample names, one per input FASTQ. Defaults to filename stems.
+        #[arg(long, value_delimiter = ',')]
+        sample_names: Option<Vec<String>>,
+
+        /// Output directory for per-sample JSON files (created if absent)
+        #[arg(long, short = 'o')]
+        output_dir: PathBuf,
+
+        /// Minimum number of samples a sequence must appear in to become a
+        /// round-2 prior (R DADA2 PSEUDO_PREVALENCE). Equivalent to
+        /// seq-table-to-fasta's --prevalence.
+        #[arg(long, default_value_t = 2)]
+        pseudo_prevalence: u32,
+
+        /// Minimum total abundance across samples to become a prior (R DADA2
+        /// PSEUDO_ABUNDANCE). Equivalent to seq-table-to-fasta's --min-abundance.
+        #[arg(long)]
+        pseudo_min_abundance: Option<u64>,
+
+        /// Optional FASTA dump of the selected round-2 priors.
+        #[arg(long)]
+        priors_out: Option<PathBuf>,
+
+        /// Phred quality score offset (33 for Sanger/Illumina 1.8+, 64 for Illumina 1.3–1.7)
+        #[arg(long, default_value_t = 33)]
+        phred_offset: u8,
+
+        /// Number of threads for dereplication and DADA2 comparisons
+        #[arg(long, default_value_t = 1)]
+        threads: usize,
+
+        /// Significance threshold for abundance-based cluster splitting (omega_a)
+        #[arg(long)]
+        omega_a: Option<f64>,
+
+        /// Significance threshold for reads not corrected to any center (omega_c)
+        #[arg(long)]
+        omega_c: Option<f64>,
+
+        /// Significance threshold for prior-sequence splitting (omega_p)
+        #[arg(long)]
+        omega_p: Option<f64>,
+
+        /// Minimum fold-enrichment above expected for cluster splitting
+        #[arg(long)]
+        min_fold: Option<f64>,
+
+        /// Minimum Hamming distance required for cluster splitting
+        #[arg(long)]
+        min_hamming: Option<u32>,
+
+        /// Minimum read abundance required for cluster splitting
+        #[arg(long)]
+        min_abund: Option<u32>,
+
+        /// Use singleton detection (omit to inherit / use default).
+        #[arg(long)]
+        detect_singletons: Option<bool>,
+
+        /// Alignment band radius (matches R's `BAND_SIZE`).
+        #[arg(long, allow_hyphen_values = true)]
+        band: Option<i32>,
+
+        /// Homopolymer-run gap penalty (matches R's `HOMOPOLYMER_GAP_PENALTY`).
+        #[arg(long, allow_hyphen_values = true)]
+        homo_gap_p: Option<i32>,
+
+        /// K-mer distance cutoff for the pre-alignment screen.
+        #[arg(long)]
+        kdist_cutoff: Option<f64>,
+
+        /// K-mer size used for the pre-alignment screen.
+        #[arg(long)]
+        kmer_size: Option<usize>,
+
+        /// Disable the k-mer pre-alignment screen.
+        #[arg(long)]
+        no_kmer_screen: Option<bool>,
+
+        /// Output compact (minified) JSON instead of pretty-printed
+        #[arg(long)]
+        compact: bool,
+
+        /// Print progress to stderr
+        #[arg(long)]
+        verbose: bool,
+    },
+
     /// Merge denoised forward and reverse reads into full-length amplicons
     ///
     /// For each sample, the forward and reverse FASTQ files are re-dereplicated
@@ -382,7 +508,7 @@ pub enum Commands {
     ///     --rev-dada rev_dada/*.json \
     ///     --fwd-fastq fwd_fastq/*.fastq.gz \
     ///     --rev-fastq rev_fastq/*.fastq.gz
-    #[command(display_order = 10)]
+    #[command(display_order = 11)]
     MergePairs {
         /// Forward dada JSON files
         #[arg(long, required = true, num_args = 1..)]
@@ -713,7 +839,7 @@ pub enum Commands {
     ///
     /// Reads one or more JSON files produced by the `dada` or `merge-pairs`
     /// subcommands and assembles a flat count matrix (samples × sequences).
-    #[command(display_order = 11)]
+    #[command(display_order = 12)]
     MakeSequenceTable {
         /// One or more JSON files from `dada` (one file per sample) or
         /// `merge-pairs` (one file containing multiple samples).
@@ -762,7 +888,7 @@ pub enum Commands {
     /// Reads a JSON file produced by `make-sequence-table` and removes sequences
     /// identified as bimeras (chimeras of two more-abundant parents).
     /// Mirrors R's `removeBimeraDenovo`.
-    #[command(display_order = 12)]
+    #[command(display_order = 13)]
     RemoveBimeraDenovo {
         /// Sequence table JSON produced by `make-sequence-table`
         input: PathBuf,
@@ -825,7 +951,7 @@ pub enum Commands {
     /// Pass `--prevalence` and/or `--min-abundance` to filter rows the same
     /// way R DADA2's pseudo-pooling selects priors
     /// (`colSums(st>0) >= PSEUDO_PREVALENCE | colSums(st) >= PSEUDO_ABUNDANCE`).
-    #[command(display_order = 15)]
+    #[command(display_order = 16)]
     SeqTableToTsv {
         /// Sequence table JSON produced by `make-sequence-table` or `remove-bimera-denovo`
         input: PathBuf,
@@ -858,7 +984,7 @@ pub enum Commands {
     /// array — one entry per query — containing the sequence, its assigned
     /// taxonomy (null where confidence is below `--min-boot`), and optionally
     /// the raw bootstrap counts.
-    #[command(display_order = 13)]
+    #[command(display_order = 14)]
     AssignTaxonomy {
         /// Query sequences: FASTA (.fa/.fa.gz/.fasta) or sequence-table JSON
         input: PathBuf,
@@ -924,7 +1050,7 @@ pub enum Commands {
     /// accession, genus, species, e.g.
     ///
     ///   >AY123456 Staphylococcus aureus
-    #[command(display_order = 14)]
+    #[command(display_order = 15)]
     AssignSpecies {
         /// Taxonomy JSON produced by `assign-taxonomy`
         input: PathBuf,
@@ -961,7 +1087,7 @@ pub enum Commands {
     /// Emits one row per assignment with the sequence ID first, followed by
     /// one column per taxonomic level in the order they appear in the input
     /// JSON.  Unassigned levels are written as `NA` (matching R DADA2 output).
-    #[command(display_order = 17)]
+    #[command(display_order = 18)]
     TaxToTsv {
         /// JSON file produced by `assign-taxonomy` or `assign-species`
         input: PathBuf,
@@ -983,7 +1109,7 @@ pub enum Commands {
     /// `pool="pseudo"` selection rule
     /// `colSums(st>0) >= PSEUDO_PREVALENCE | colSums(st) >= PSEUDO_ABUNDANCE`),
     /// pass `--prevalence` and/or `--min-abundance`.
-    #[command(display_order = 16)]
+    #[command(display_order = 17)]
     SeqTableToFasta {
         /// JSON file produced by the `make-sequence-table` subcommand
         input: PathBuf,

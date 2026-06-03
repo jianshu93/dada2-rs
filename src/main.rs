@@ -352,6 +352,7 @@ fn main() -> io::Result<()> {
             trace_no_members,
             trace_min_abund,
             output,
+            output_dir,
             compact,
             verbose,
         } => {
@@ -361,7 +362,148 @@ fn main() -> io::Result<()> {
                 .build()
                 .map_err(io::Error::other)?;
 
-            let (derep, json_sample) = load_derep_for_dada(&input, phred_offset, &pool, verbose)?;
+            // ---- Multi-input: independent per-sample (serial, NOT pooled) ----
+            if input.len() > 1 {
+                // Reject single-sample-only flags.
+                let mut bad: Vec<&str> = Vec::new();
+                if output.is_some() {
+                    bad.push("--output/-o");
+                }
+                if sample_name.is_some() {
+                    bad.push("--sample-name");
+                }
+                if aux_outputs {
+                    bad.push("--aux-outputs");
+                }
+                if cluster_trace.is_some() {
+                    bad.push("--cluster-trace");
+                }
+                if trace_no_members {
+                    bad.push("--trace-no-members");
+                }
+                // `trace_min_abund` has a default of 1; only flag if non-default.
+                if trace_min_abund != 1 {
+                    bad.push("--trace-min-abund");
+                }
+                if !bad.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "{} {} single-sample-only and cannot be combined with multiple inputs; use --output-dir for per-sample output",
+                            bad.join(", "),
+                            if bad.len() == 1 { "is" } else { "are" },
+                        ),
+                    ));
+                }
+                let output_dir = output_dir.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "more than one input given: --output-dir is required (one {sample}.json per sample is written there)",
+                    )
+                })?;
+                std::fs::create_dir_all(&output_dir)?;
+
+                // Load the optional prior set once.
+                let prior_set: Option<std::collections::HashSet<String>> = match prior {
+                    Some(ref prior_path) => Some(
+                        read_fasta_records(prior_path)
+                            .with_path(prior_path)?
+                            .into_iter()
+                            .map(|(_, seq)| String::from_utf8_lossy(&seq).to_ascii_uppercase())
+                            .collect(),
+                    ),
+                    None => None,
+                };
+
+                // Resolve parameters once (shared across samples).
+                let resolved = resolve_dada_params(
+                    &error_model,
+                    use_err_in,
+                    inherit_err_params,
+                    threads,
+                    false, // aux_outputs (rejected above for multi-input)
+                    false, // pool
+                    verbose,
+                    omega_a,
+                    omega_c,
+                    omega_p,
+                    min_fold,
+                    min_hamming,
+                    min_abund,
+                    detect_singletons,
+                    band,
+                    homo_gap_p,
+                    kdist_cutoff,
+                    kmer_size,
+                    no_kmer_screen,
+                )?;
+
+                for path in &input {
+                    let (derep, json_sample) =
+                        load_derep_for_dada(path, phred_offset, &pool, verbose)?;
+                    let mut raw_inputs: Vec<dada::RawInput> = derep
+                        .uniques
+                        .into_iter()
+                        .zip(derep.quals)
+                        .map(|((seq, count), quals)| {
+                            let sequence = String::from_utf8(seq).unwrap_or_else(|e| {
+                                String::from_utf8_lossy(e.as_bytes()).into_owned()
+                            });
+                            dada::RawInput {
+                                seq: sequence,
+                                abundance: count as u32,
+                                prior: false,
+                                quals: Some(quals),
+                            }
+                        })
+                        .collect();
+                    if raw_inputs.is_empty() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("{}: no uniques found", path.display()),
+                        ));
+                    }
+                    if let Some(ref set) = prior_set {
+                        let n_marked = mark_priors(&mut raw_inputs, set);
+                        if verbose {
+                            eprintln!(
+                                "[dada] {} of {} unique(s) marked as prior in {}",
+                                n_marked,
+                                raw_inputs.len(),
+                                path.display(),
+                            );
+                        }
+                    }
+                    let sample = json_sample.unwrap_or_else(|| fastq_stem(path));
+                    let json = denoise_and_serialize(
+                        "dada",
+                        &sample,
+                        &raw_inputs,
+                        &resolved.params,
+                        &resolved.run,
+                        &pool,
+                        compact,
+                        verbose,
+                    )?;
+                    let out_path = output_dir.join(format!("{sample}.json"));
+                    std::fs::write(&out_path, &json)?;
+                    if verbose {
+                        eprintln!("[dada] wrote {}", out_path.display());
+                    }
+                }
+                return Ok(());
+            }
+
+            // ---- Single input: preserve existing behavior byte-for-byte ----
+            if output_dir.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "--output-dir is only valid with multiple inputs; for a single input use --output/-o or stdout",
+                ));
+            }
+            let input = &input[0];
+
+            let (derep, json_sample) = load_derep_for_dada(input, phred_offset, &pool, verbose)?;
 
             let mut raw_inputs: Vec<dada::RawInput> = derep
                 .uniques
@@ -393,13 +535,7 @@ fn main() -> io::Result<()> {
                     .into_iter()
                     .map(|(_, seq)| String::from_utf8_lossy(&seq).to_ascii_uppercase())
                     .collect();
-                let mut n_marked = 0usize;
-                for inp in &mut raw_inputs {
-                    if prior_seqs.contains(&inp.seq.to_ascii_uppercase()) {
-                        inp.prior = true;
-                        n_marked += 1;
-                    }
-                }
+                let n_marked = mark_priors(&mut raw_inputs, &prior_seqs);
                 if verbose {
                     eprintln!(
                         "[dada] {} of {} unique(s) marked as prior from {}",
@@ -410,163 +546,31 @@ fn main() -> io::Result<()> {
                 }
             }
 
-            // ---- Load error model JSON ----
-            // `params` is optional so older err-model JSONs (pre-#4 follow-up)
-            // still load.  When present and `--inherit-err-params` is set, any
-            // CLI flag the user did not explicitly pass falls through to the
-            // err model's value instead of the built-in default.  Without the
-            // inherit flag, mismatches between the CLI's effective values and
-            // the err model trigger a warning so the user notices drift.
-            #[derive(serde::Deserialize)]
-            struct ErrorModelJson {
-                nq: usize,
-                err_in: Vec<Vec<f64>>,
-                err_out: Vec<Vec<f64>>,
-                #[serde(default)]
-                params: Option<LearnedErrParams>,
-            }
-
-            let em: ErrorModelJson =
-                read_tagged_json(&error_model, &["learn-errors", "errors-from-sample"])
-                    .with_path(&error_model)?;
-
-            let nq = em.nq;
-            let rows = if use_err_in { &em.err_in } else { &em.err_out };
-            if rows.len() != 16 || rows.iter().any(|r| r.len() != nq) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "Error model matrix must be 16 × {nq}, got {} rows",
-                        rows.len()
-                    ),
-                ));
-            }
-            // Flatten row-major: row r, column q → index r*nq + q
-            let err_mat: Vec<f64> = rows.iter().flat_map(|r| r.iter().copied()).collect();
-
-            if inherit_err_params && em.params.is_none() {
-                eprintln!(
-                    "[dada] warning: --inherit-err-params requested but error model {} has no `params` block (likely produced by a pre-provenance version); falling back to built-in defaults",
-                    error_model.display(),
-                );
-            }
-
-            // ---- Resolve each parameter via three-tier precedence:
-            //      1. CLI explicit  (`Some(v)`)
-            //      2. Inherited from err-model `params` (if `--inherit-err-params`)
-            //      3. Built-in default
-            // For the warn path (inherit OFF), we still pick CLI-or-default,
-            // then compare against err-model and emit a per-mismatch warning.
-            let p = em.params.as_ref();
-            macro_rules! resolve {
-                ($cli:expr, $em_field:ident, $default:expr) => {{
-                    match ($cli, inherit_err_params, p) {
-                        (Some(v), _, _) => v,
-                        (None, true, Some(em_params)) => em_params.$em_field,
-                        _ => $default,
-                    }
-                }};
-            }
-            let omega_a = resolve!(omega_a, omega_a, 1e-40);
-            // `omega_c` is intentionally not inherited from the err model:
-            // learn-errors uses 0 (R DADA2 convention), dada uses 1e-40.
-            let omega_c = omega_c.unwrap_or(1e-40);
-            let omega_p = resolve!(omega_p, omega_p, 1e-4);
-            let min_fold = resolve!(min_fold, min_fold, 1.0);
-            let min_hamming = resolve!(min_hamming, min_hamming, 1);
-            let min_abund = resolve!(min_abund, min_abund, 1);
-            let detect_singletons = resolve!(detect_singletons, detect_singletons, false);
-            let band = resolve!(band, band, 16);
-            let homo_gap_p = resolve!(homo_gap_p, homo_gap_p, -8);
-            let kdist_cutoff = resolve!(kdist_cutoff, kdist_cutoff, 0.42);
-            let kmer_size = resolve!(kmer_size, kmer_size, 5);
-            // `no_kmer_screen` (CLI) inverts `use_kmers` (algorithm).
-            let use_kmers = match (no_kmer_screen, inherit_err_params, p) {
-                (Some(no), _, _) => !no,
-                (None, true, Some(em_params)) => em_params.use_kmers,
-                _ => true,
-            };
-
-            // ---- Build algorithm parameters ----
-            let align_params = AlignParams {
-                match_score: 5,
-                mismatch: -4,
-                gap_p: -8,
-                homo_gap_p,
-                use_kmers,
-                kdist_cutoff,
-                kmer_size,
-                band,
-                vectorized: true,
-                gapless: true,
-            };
-
-            let dada_params = dada::DadaParams {
-                align: align_params,
-                err_mat,
-                err_ncol: nq,
+            // ---- Load error model + resolve parameters (shared helper) ----
+            let resolved = resolve_dada_params(
+                &error_model,
+                use_err_in,
+                inherit_err_params,
+                threads,
+                aux_outputs,
+                false, // pool
+                verbose,
                 omega_a,
                 omega_c,
                 omega_p,
-                detect_singletons,
-                max_clust: 0,
                 min_fold,
                 min_hamming,
                 min_abund,
-                use_quals: true,
-                final_consensus: false,
-                multithread: threads > 1,
-                verbose,
-                greedy: true,
-                aux_outputs,
-            };
-
-            // ---- Consistency warnings (only when NOT inheriting) ----
-            // When the user opts out of inheritance we still want them to
-            // notice if their dada-call params drifted from the err model,
-            // so emit a one-line warning per mismatched field.  Comparison
-            // tolerates the absence of `params` in older err models.
-            if !inherit_err_params && let Some(em_params) = p {
-                let mut mismatches: Vec<String> = Vec::new();
-                macro_rules! check {
-                    ($name:literal, $cli_val:expr, $em_val:expr) => {
-                        if $cli_val != $em_val {
-                            mismatches.push(format!(
-                                "  {} = {:?} (err model: {:?})",
-                                $name, $cli_val, $em_val
-                            ));
-                        }
-                    };
-                }
-                check!("omega_a", omega_a, em_params.omega_a);
-                // omega_c is intentionally not embedded by learn-errors
-                // (learn-time and dada-time defaults differ in R DADA2),
-                // so we don't compare against the err model here.
-                check!("omega_p", omega_p, em_params.omega_p);
-                check!("min_fold", min_fold, em_params.min_fold);
-                check!("min_hamming", min_hamming, em_params.min_hamming);
-                check!("min_abund", min_abund, em_params.min_abund);
-                check!(
-                    "detect_singletons",
-                    detect_singletons,
-                    em_params.detect_singletons
-                );
-                check!("band", band, em_params.band);
-                check!("homo_gap_p", homo_gap_p, em_params.homo_gap_p);
-                check!("kdist_cutoff", kdist_cutoff, em_params.kdist_cutoff);
-                check!("kmer_size", kmer_size, em_params.kmer_size);
-                check!("use_kmers", use_kmers, em_params.use_kmers);
-                if !mismatches.is_empty() {
-                    eprintln!(
-                        "[dada] warning: {} dada parameter(s) differ from error model {}; pass --inherit-err-params to adopt the err model's values:",
-                        mismatches.len(),
-                        error_model.display(),
-                    );
-                    for line in &mismatches {
-                        eprintln!("{line}");
-                    }
-                }
-            }
+                detect_singletons,
+                band,
+                homo_gap_p,
+                kdist_cutoff,
+                kmer_size,
+                no_kmer_screen,
+            )?;
+            let dada_params = resolved.params;
+            let run_params = resolved.run;
+            let nq = resolved.nq;
 
             // ---- Run DADA2 ----
             let result = pool
@@ -606,7 +610,7 @@ fn main() -> io::Result<()> {
                     &raw_inputs,
                     &result,
                     Some(&dada_params.err_mat),
-                    em.nq,
+                    nq,
                     trace_params,
                     compact,
                 )?;
@@ -685,7 +689,7 @@ fn main() -> io::Result<()> {
 
             let sample = sample_name
                 .or(json_sample)
-                .unwrap_or_else(|| fastq_stem(&input));
+                .unwrap_or_else(|| fastq_stem(input));
             let total_reads: u32 = result.clusters.iter().map(|c| c.reads).sum();
 
             let asvs: Vec<AsvEntry> = result
@@ -772,20 +776,8 @@ fn main() -> io::Result<()> {
                     nshroud: result.nshroud,
                 },
                 params: DadaRunParams {
-                    omega_a,
-                    omega_c,
-                    omega_p,
-                    min_fold,
-                    min_hamming,
-                    min_abund,
-                    detect_singletons,
-                    band,
-                    homo_gap_p,
-                    kdist_cutoff,
-                    kmer_size,
-                    use_kmers,
-                    pool: false,
                     n_prior: raw_inputs.iter().filter(|r| r.prior).count(),
+                    ..run_params
                 },
                 map: result.map,
                 aux: aux_json,
@@ -953,13 +945,7 @@ fn main() -> io::Result<()> {
                     .into_iter()
                     .map(|(_, seq)| String::from_utf8_lossy(&seq).to_ascii_uppercase())
                     .collect();
-                let mut n_marked = 0usize;
-                for inp in &mut raw_inputs {
-                    if prior_seqs.contains(&inp.seq.to_ascii_uppercase()) {
-                        inp.prior = true;
-                        n_marked += 1;
-                    }
-                }
+                let n_marked = mark_priors(&mut raw_inputs, &prior_seqs);
                 if verbose {
                     eprintln!(
                         "[dada-pooled] {} of {} merged unique(s) marked as prior from {}",
@@ -970,93 +956,31 @@ fn main() -> io::Result<()> {
                 }
             }
 
-            // ---- Load error model JSON (same logic as `dada`) ----
-            #[derive(serde::Deserialize)]
-            struct ErrorModelJson {
-                nq: usize,
-                err_in: Vec<Vec<f64>>,
-                err_out: Vec<Vec<f64>>,
-                #[serde(default)]
-                params: Option<LearnedErrParams>,
-            }
-            let em: ErrorModelJson =
-                read_tagged_json(&error_model, &["learn-errors", "errors-from-sample"])
-                    .with_path(&error_model)?;
-            let nq = em.nq;
-            let rows = if use_err_in { &em.err_in } else { &em.err_out };
-            if rows.len() != 16 || rows.iter().any(|r| r.len() != nq) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "Error model matrix must be 16 × {nq}, got {} rows",
-                        rows.len()
-                    ),
-                ));
-            }
-            let err_mat: Vec<f64> = rows.iter().flat_map(|r| r.iter().copied()).collect();
-
-            // ---- Resolve parameters (same precedence as `dada`) ----
-            let p = em.params.as_ref();
-            macro_rules! resolve {
-                ($cli:expr, $em_field:ident, $default:expr) => {{
-                    match ($cli, inherit_err_params, p) {
-                        (Some(v), _, _) => v,
-                        (None, true, Some(em_params)) => em_params.$em_field,
-                        _ => $default,
-                    }
-                }};
-            }
-            let omega_a = resolve!(omega_a, omega_a, 1e-40);
-            // `omega_c` is intentionally not inherited from the err model:
-            // learn-errors uses 0 (R DADA2 convention), dada uses 1e-40.
-            let omega_c = omega_c.unwrap_or(1e-40);
-            let omega_p = resolve!(omega_p, omega_p, 1e-4);
-            let min_fold = resolve!(min_fold, min_fold, 1.0);
-            let min_hamming = resolve!(min_hamming, min_hamming, 1);
-            let min_abund = resolve!(min_abund, min_abund, 1);
-            let detect_singletons = resolve!(detect_singletons, detect_singletons, false);
-            let band = resolve!(band, band, 16);
-            let homo_gap_p = resolve!(homo_gap_p, homo_gap_p, -8);
-            let kdist_cutoff = resolve!(kdist_cutoff, kdist_cutoff, 0.42);
-            let kmer_size = resolve!(kmer_size, kmer_size, 5);
-            let use_kmers = match (no_kmer_screen, inherit_err_params, p) {
-                (Some(no), _, _) => !no,
-                (None, true, Some(em_params)) => em_params.use_kmers,
-                _ => true,
-            };
-
-            let align_params = AlignParams {
-                match_score: 5,
-                mismatch: -4,
-                gap_p: -8,
-                homo_gap_p,
-                use_kmers,
-                kdist_cutoff,
-                kmer_size,
-                band,
-                vectorized: true,
-                gapless: true,
-            };
-
-            let dada_params = dada::DadaParams {
-                align: align_params,
-                err_mat,
-                err_ncol: nq,
+            // ---- Load error model + resolve parameters (shared helper) ----
+            let resolved = resolve_dada_params(
+                &error_model,
+                use_err_in,
+                inherit_err_params,
+                threads,
+                false, // aux_outputs
+                true,  // pool
+                verbose,
                 omega_a,
                 omega_c,
                 omega_p,
-                detect_singletons,
-                max_clust: 0,
                 min_fold,
                 min_hamming,
                 min_abund,
-                use_quals: true,
-                final_consensus: false,
-                multithread: threads > 1,
-                verbose,
-                greedy: true,
-                aux_outputs: false,
-            };
+                detect_singletons,
+                band,
+                homo_gap_p,
+                kdist_cutoff,
+                kmer_size,
+                no_kmer_screen,
+            )?;
+            let dada_params = resolved.params;
+            let mut run_params = resolved.run;
+            run_params.n_prior = raw_inputs.iter().filter(|r| r.prior).count();
 
             // ---- Run DADA once on the merged table ----
             let t_merge = t_merge.elapsed();
@@ -1102,23 +1026,6 @@ fn main() -> io::Result<()> {
                 params: DadaRunParams,
                 map: Vec<Option<usize>>,
             }
-
-            let run_params = DadaRunParams {
-                omega_a,
-                omega_c,
-                omega_p,
-                min_fold,
-                min_hamming,
-                min_abund,
-                detect_singletons,
-                band,
-                homo_gap_p,
-                kdist_cutoff,
-                kmer_size,
-                use_kmers,
-                pool: true,
-                n_prior: raw_inputs.iter().filter(|r| r.prior).count(),
-            };
 
             for (s, sample_name) in sample_names.iter().enumerate() {
                 // Sum per-cluster reads for this sample by walking its local uniques.
@@ -1219,6 +1126,256 @@ fn main() -> io::Result<()> {
                     t_output.as_secs_f64(),
                     pct(t_output),
                 );
+            }
+        }
+
+        Commands::DadaPseudo {
+            input,
+            error_model,
+            use_err_in,
+            inherit_err_params,
+            sample_names,
+            output_dir,
+            pseudo_prevalence,
+            pseudo_min_abundance,
+            priors_out,
+            phred_offset,
+            threads,
+            omega_a,
+            omega_c,
+            omega_p,
+            min_fold,
+            min_hamming,
+            min_abund,
+            detect_singletons,
+            band,
+            homo_gap_p,
+            kdist_cutoff,
+            kmer_size,
+            no_kmer_screen,
+            compact,
+            verbose,
+        } => {
+            use std::collections::{HashMap, HashSet};
+
+            let n_samples = input.len();
+            if let Some(ref names) = sample_names
+                && names.len() != n_samples
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "--sample-names has {} entries but {} input file(s) given",
+                        names.len(),
+                        n_samples
+                    ),
+                ));
+            }
+
+            std::fs::create_dir_all(&output_dir)?;
+
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .map_err(io::Error::other)?;
+
+            // ---- Load + cache each sample's uniques once ----
+            let mut sample_raws: Vec<Vec<dada::RawInput>> = Vec::with_capacity(n_samples);
+            let mut json_samples: Vec<Option<String>> = Vec::with_capacity(n_samples);
+            for path in &input {
+                let (derep, json_sample) = load_derep_for_dada(path, phred_offset, &pool, verbose)?;
+                let raws: Vec<dada::RawInput> = derep
+                    .uniques
+                    .into_iter()
+                    .zip(derep.quals)
+                    .map(|((seq, count), quals)| {
+                        let sequence = String::from_utf8(seq)
+                            .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+                        dada::RawInput {
+                            seq: sequence,
+                            abundance: count as u32,
+                            prior: false,
+                            quals: Some(quals),
+                        }
+                    })
+                    .collect();
+                if raws.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("{}: no uniques found", path.display()),
+                    ));
+                }
+                sample_raws.push(raws);
+                json_samples.push(json_sample);
+            }
+
+            // Resolve sample names: CLI override > JSON-embedded > filename stem.
+            let sample_names: Vec<String> = match sample_names {
+                Some(names) => names,
+                None => input
+                    .iter()
+                    .zip(json_samples)
+                    .map(|(p, js)| js.unwrap_or_else(|| fastq_stem(p)))
+                    .collect(),
+            };
+
+            // Resolve parameters once (shared across both rounds and all samples).
+            let resolved = resolve_dada_params(
+                &error_model,
+                use_err_in,
+                inherit_err_params,
+                threads,
+                false, // aux_outputs
+                false, // pool (pseudo is per-sample, not pooled)
+                verbose,
+                omega_a,
+                omega_c,
+                omega_p,
+                min_fold,
+                min_hamming,
+                min_abund,
+                detect_singletons,
+                band,
+                homo_gap_p,
+                kdist_cutoff,
+                kmer_size,
+                no_kmer_screen,
+            )?;
+
+            // ---- Round 1: denoise each sample independently (no priors) ----
+            if verbose {
+                eprintln!("[dada-pseudo] round 1: {n_samples} sample(s), no priors");
+            }
+            // Collect per-sample round-1 ASV (sequence, abundance) pairs.
+            let mut round1_asvs: Vec<Vec<(String, u32)>> = Vec::with_capacity(n_samples);
+            for (s, raws) in sample_raws.iter().enumerate() {
+                let result = pool
+                    .install(|| dada::dada_uniques(raws, &resolved.params))
+                    .map_err(io::Error::other)?;
+                let asvs: Vec<(String, u32)> = result
+                    .clusters
+                    .iter()
+                    .map(|c| {
+                        let sequence: String = c
+                            .sequence
+                            .iter()
+                            .map(|&b| misc::nt_decode(b) as char)
+                            .collect();
+                        (sequence, c.reads)
+                    })
+                    .collect();
+                if verbose {
+                    eprintln!(
+                        "[dada-pseudo]   round 1 {}: {} ASV(s)",
+                        sample_names[s],
+                        asvs.len(),
+                    );
+                }
+                round1_asvs.push(asvs);
+            }
+
+            // ---- Build a sequence table from round-1 ASVs (samples × sequences) ----
+            let mut seq_index: HashMap<String, usize> = HashMap::new();
+            let mut sequences: Vec<String> = Vec::new();
+            for asvs in &round1_asvs {
+                for (seq, _) in asvs {
+                    if !seq_index.contains_key(seq) {
+                        seq_index.insert(seq.clone(), sequences.len());
+                        sequences.push(seq.clone());
+                    }
+                }
+            }
+            let nseq = sequences.len();
+            let mut counts: Vec<Vec<u64>> = vec![vec![0u64; nseq]; n_samples];
+            for (s, asvs) in round1_asvs.iter().enumerate() {
+                for (seq, abund) in asvs {
+                    let j = seq_index[seq];
+                    counts[s][j] += *abund as u64;
+                }
+            }
+            let table = SequenceTable {
+                samples: sample_names.clone(),
+                sequence_ids: sequences.iter().map(|s| HashAlgo::Sha1.digest(s)).collect(),
+                sequences,
+                counts,
+            };
+
+            // ---- Select round-2 priors via R's PSEUDO rule ----
+            let selected = select_sequences(&table, Some(pseudo_prevalence), pseudo_min_abundance);
+            let prior_set: HashSet<String> = selected
+                .iter()
+                .map(|&j| table.sequences[j].to_ascii_uppercase())
+                .collect();
+
+            if verbose {
+                eprintln!(
+                    "[dada-pseudo] selected {} prior sequence(s) from {} round-1 ASV(s) (prevalence>={}{})",
+                    prior_set.len(),
+                    table.sequences.len(),
+                    pseudo_prevalence,
+                    match pseudo_min_abundance {
+                        Some(m) => format!(" or total-abundance>={m}"),
+                        None => String::new(),
+                    },
+                );
+            }
+
+            // ---- Optional priors FASTA dump ----
+            if let Some(ref priors_path) = priors_out {
+                if let Some(parent) = priors_path.parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let mut fasta = String::new();
+                for (i, &j) in selected.iter().enumerate() {
+                    fasta.push_str(&format!(">prior{}\n{}\n", i + 1, table.sequences[j]));
+                }
+                std::fs::write(priors_path, fasta)?;
+                if verbose {
+                    eprintln!("[dada-pseudo] wrote priors to {}", priors_path.display());
+                }
+            }
+
+            if verbose && (n_samples < 2 || prior_set.is_empty()) {
+                eprintln!(
+                    "[dada-pseudo] note: {} — round 2 is equivalent to round 1 (no priors applied)",
+                    if n_samples < 2 {
+                        "fewer than 2 samples".to_string()
+                    } else {
+                        "no sequences met the prior-selection threshold".to_string()
+                    },
+                );
+            }
+
+            // ---- Round 2: re-denoise each sample with the priors flagged ----
+            if verbose {
+                eprintln!("[dada-pseudo] round 2: denoising with priors");
+            }
+            for (s, sample_name) in sample_names.iter().enumerate() {
+                let raws = &mut sample_raws[s];
+                let n_marked = mark_priors(raws, &prior_set);
+                if verbose {
+                    eprintln!(
+                        "[dada-pseudo]   round 2 {sample_name}: {n_marked} of {} unique(s) flagged as prior",
+                        raws.len(),
+                    );
+                }
+                let json = denoise_and_serialize(
+                    "dada-pseudo",
+                    sample_name,
+                    raws,
+                    &resolved.params,
+                    &resolved.run,
+                    &pool,
+                    compact,
+                    verbose,
+                )?;
+                let out_path = output_dir.join(format!("{sample_name}.json"));
+                std::fs::write(&out_path, &json)?;
+                if verbose {
+                    eprintln!("[dada-pseudo] wrote {}", out_path.display());
+                }
             }
         }
 
@@ -3026,6 +3183,322 @@ fn is_json_path(path: &Path) -> bool {
             .and_then(|s| Path::new(s).extension())
             .and_then(|e| e.to_str())
             == Some("json")
+}
+
+/// Error-model JSON shape shared by `dada`, `dada-pooled`, and `dada-pseudo`.
+#[derive(serde::Deserialize)]
+struct ErrorModelJson {
+    nq: usize,
+    err_in: Vec<Vec<f64>>,
+    err_out: Vec<Vec<f64>>,
+    #[serde(default)]
+    params: Option<LearnedErrParams>,
+}
+
+/// Bundle of resolved DADA parameters plus the scalars needed to serialize a
+/// `DadaRunParams` provenance block. Produced by [`resolve_dada_params`] so the
+/// `dada`, `dada-pooled`, and `dada-pseudo` handlers all share one code path.
+struct ResolvedDada {
+    params: dada::DadaParams,
+    nq: usize,
+    run: DadaRunParams,
+}
+
+/// Load the error model and resolve every DADA parameter via the three-tier
+/// precedence (CLI explicit > inherited from err-model `params` > built-in
+/// default). Emits the same warnings the inline handlers used to.
+///
+/// `aux_outputs` and `pool` are handler-specific and passed in. `n_prior` is
+/// filled in later by the caller (priors are marked after this point), so it is
+/// left at 0 here.
+#[allow(clippy::too_many_arguments)]
+fn resolve_dada_params(
+    error_model: &Path,
+    use_err_in: bool,
+    inherit_err_params: bool,
+    threads: usize,
+    aux_outputs: bool,
+    pool: bool,
+    verbose: bool,
+    omega_a: Option<f64>,
+    omega_c: Option<f64>,
+    omega_p: Option<f64>,
+    min_fold: Option<f64>,
+    min_hamming: Option<u32>,
+    min_abund: Option<u32>,
+    detect_singletons: Option<bool>,
+    band: Option<i32>,
+    homo_gap_p: Option<i32>,
+    kdist_cutoff: Option<f64>,
+    kmer_size: Option<usize>,
+    no_kmer_screen: Option<bool>,
+) -> io::Result<ResolvedDada> {
+    let em: ErrorModelJson = read_tagged_json(error_model, &["learn-errors", "errors-from-sample"])
+        .with_path(error_model)?;
+    let nq = em.nq;
+    let rows = if use_err_in { &em.err_in } else { &em.err_out };
+    if rows.len() != 16 || rows.iter().any(|r| r.len() != nq) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Error model matrix must be 16 × {nq}, got {} rows",
+                rows.len()
+            ),
+        ));
+    }
+    let err_mat: Vec<f64> = rows.iter().flat_map(|r| r.iter().copied()).collect();
+
+    if inherit_err_params && em.params.is_none() {
+        eprintln!(
+            "[dada] warning: --inherit-err-params requested but error model {} has no `params` block (likely produced by a pre-provenance version); falling back to built-in defaults",
+            error_model.display(),
+        );
+    }
+
+    let p = em.params.as_ref();
+    macro_rules! resolve {
+        ($cli:expr, $em_field:ident, $default:expr) => {{
+            match ($cli, inherit_err_params, p) {
+                (Some(v), _, _) => v,
+                (None, true, Some(em_params)) => em_params.$em_field,
+                _ => $default,
+            }
+        }};
+    }
+    let omega_a = resolve!(omega_a, omega_a, 1e-40);
+    // `omega_c` is intentionally not inherited from the err model:
+    // learn-errors uses 0 (R DADA2 convention), dada uses 1e-40.
+    let omega_c = omega_c.unwrap_or(1e-40);
+    let omega_p = resolve!(omega_p, omega_p, 1e-4);
+    let min_fold = resolve!(min_fold, min_fold, 1.0);
+    let min_hamming = resolve!(min_hamming, min_hamming, 1);
+    let min_abund = resolve!(min_abund, min_abund, 1);
+    let detect_singletons = resolve!(detect_singletons, detect_singletons, false);
+    let band = resolve!(band, band, 16);
+    let homo_gap_p = resolve!(homo_gap_p, homo_gap_p, -8);
+    let kdist_cutoff = resolve!(kdist_cutoff, kdist_cutoff, 0.42);
+    let kmer_size = resolve!(kmer_size, kmer_size, 5);
+    let use_kmers = match (no_kmer_screen, inherit_err_params, p) {
+        (Some(no), _, _) => !no,
+        (None, true, Some(em_params)) => em_params.use_kmers,
+        _ => true,
+    };
+
+    // ---- Consistency warnings (only when NOT inheriting) ----
+    if !inherit_err_params && let Some(em_params) = p {
+        let mut mismatches: Vec<String> = Vec::new();
+        macro_rules! check {
+            ($name:literal, $cli_val:expr, $em_val:expr) => {
+                if $cli_val != $em_val {
+                    mismatches.push(format!(
+                        "  {} = {:?} (err model: {:?})",
+                        $name, $cli_val, $em_val
+                    ));
+                }
+            };
+        }
+        check!("omega_a", omega_a, em_params.omega_a);
+        check!("omega_p", omega_p, em_params.omega_p);
+        check!("min_fold", min_fold, em_params.min_fold);
+        check!("min_hamming", min_hamming, em_params.min_hamming);
+        check!("min_abund", min_abund, em_params.min_abund);
+        check!(
+            "detect_singletons",
+            detect_singletons,
+            em_params.detect_singletons
+        );
+        check!("band", band, em_params.band);
+        check!("homo_gap_p", homo_gap_p, em_params.homo_gap_p);
+        check!("kdist_cutoff", kdist_cutoff, em_params.kdist_cutoff);
+        check!("kmer_size", kmer_size, em_params.kmer_size);
+        check!("use_kmers", use_kmers, em_params.use_kmers);
+        if !mismatches.is_empty() {
+            eprintln!(
+                "[dada] warning: {} dada parameter(s) differ from error model {}; pass --inherit-err-params to adopt the err model's values:",
+                mismatches.len(),
+                error_model.display(),
+            );
+            for line in &mismatches {
+                eprintln!("{line}");
+            }
+        }
+    }
+
+    let align_params = AlignParams {
+        match_score: 5,
+        mismatch: -4,
+        gap_p: -8,
+        homo_gap_p,
+        use_kmers,
+        kdist_cutoff,
+        kmer_size,
+        band,
+        vectorized: true,
+        gapless: true,
+    };
+
+    let params = dada::DadaParams {
+        align: align_params,
+        err_mat,
+        err_ncol: nq,
+        omega_a,
+        omega_c,
+        omega_p,
+        detect_singletons,
+        max_clust: 0,
+        min_fold,
+        min_hamming,
+        min_abund,
+        use_quals: true,
+        final_consensus: false,
+        multithread: threads > 1,
+        verbose,
+        greedy: true,
+        aux_outputs,
+    };
+
+    let run = DadaRunParams {
+        omega_a,
+        omega_c,
+        omega_p,
+        min_fold,
+        min_hamming,
+        min_abund,
+        detect_singletons,
+        band,
+        homo_gap_p,
+        kdist_cutoff,
+        kmer_size,
+        use_kmers,
+        pool,
+        n_prior: 0,
+    };
+
+    Ok(ResolvedDada { params, nq, run })
+}
+
+/// Mark each RawInput whose (uppercased) sequence is in `prior_set` as a prior.
+/// Returns the number marked.
+fn mark_priors(
+    raws: &mut [dada::RawInput],
+    prior_set: &std::collections::HashSet<String>,
+) -> usize {
+    let mut n = 0usize;
+    for inp in raws.iter_mut() {
+        if prior_set.contains(&inp.seq.to_ascii_uppercase()) {
+            inp.prior = true;
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Run `dada_uniques` on one sample's uniques and serialize the standard
+/// (non-pooled) `DadaOutput` JSON, returning the pretty/compact string. Used by
+/// the multi-input `dada` path and by `dada-pseudo`. The single-input `dada`
+/// path keeps its own inline serialization because it also emits aux outputs
+/// and cluster traces.
+#[allow(clippy::too_many_arguments)]
+fn denoise_and_serialize(
+    tag: &'static str,
+    sample: &str,
+    raw_inputs: &[dada::RawInput],
+    params: &dada::DadaParams,
+    run_params: &DadaRunParams,
+    pool: &rayon::ThreadPool,
+    compact: bool,
+    verbose: bool,
+) -> io::Result<String> {
+    #[derive(Serialize)]
+    struct AsvEntry {
+        sequence: String,
+        abundance: u32,
+        birth_type: String,
+        birth_pval: f64,
+        birth_fold: f64,
+        birth_e: f64,
+    }
+    #[derive(Serialize)]
+    struct DadaStats {
+        nalign: u32,
+        nshroud: u32,
+    }
+    #[derive(Serialize)]
+    struct DadaOutput {
+        sample: String,
+        num_asvs: usize,
+        total_reads: u32,
+        asvs: Vec<AsvEntry>,
+        stats: DadaStats,
+        params: DadaRunParams,
+        map: Vec<Option<usize>>,
+    }
+
+    let result = pool
+        .install(|| dada::dada_uniques(raw_inputs, params))
+        .map_err(io::Error::other)?;
+
+    if verbose {
+        eprintln!(
+            "[{tag}] {} ASV(s) from {} unique input(s); {} aligns, {} shrouded",
+            result.clusters.len(),
+            raw_inputs.len(),
+            result.nalign,
+            result.nshroud,
+        );
+    }
+
+    let total_reads: u32 = result.clusters.iter().map(|c| c.reads).sum();
+    let asvs: Vec<AsvEntry> = result
+        .clusters
+        .iter()
+        .map(|c| {
+            let sequence: String = c
+                .sequence
+                .iter()
+                .map(|&b| misc::nt_decode(b) as char)
+                .collect();
+            let birth_type = match &c.birth_type {
+                BirthType::Initial => "Initial",
+                BirthType::Abundance => "Abundance",
+                BirthType::Prior => "Prior",
+                BirthType::Singleton => "Singleton",
+            }
+            .to_string();
+            AsvEntry {
+                sequence,
+                abundance: c.reads,
+                birth_type,
+                birth_pval: c.birth_pval,
+                birth_fold: c.birth_fold,
+                birth_e: c.birth_e,
+            }
+        })
+        .collect();
+
+    let mut run_params = *run_params;
+    run_params.n_prior = raw_inputs.iter().filter(|r| r.prior).count();
+
+    let out = DadaOutput {
+        sample: sample.to_string(),
+        num_asvs: asvs.len(),
+        total_reads,
+        asvs,
+        stats: DadaStats {
+            nalign: result.nalign,
+            nshroud: result.nshroud,
+        },
+        params: run_params,
+        map: result.map,
+    };
+
+    let tagged = Tagged::new(tag, out);
+    if compact {
+        serde_json::to_string(&tagged)
+    } else {
+        serde_json::to_string_pretty(&tagged)
+    }
+    .map_err(io::Error::other)
 }
 
 /// Build a [`derep::Derep`] for `dada` / `dada-pooled` from either a FASTQ file
