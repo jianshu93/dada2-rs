@@ -209,6 +209,67 @@ fn dada_pseudo_matches_manual_recipe() {
     }
 }
 
+/// dada-pseudo output must be accepted by the downstream consumers that key off
+/// the `dada2_rs_command` tag (merge-pairs and make-sequence-table). This is the
+/// path that broke in benchmarking: those readers allowlisted only "dada" /
+/// "dada-pooled". The reverse error model is shared with the forward one here —
+/// we're asserting the tag is *accepted*, not denoising correctness.
+#[test]
+fn dada_pseudo_output_feeds_downstream_steps() {
+    let dir = scratch("pseudo_downstream");
+    let err = shared_err_model();
+    let f1 = fixture("sam1F.fastq.gz");
+    let f2 = fixture("sam2F.fastq.gz");
+    let r1 = fixture("sam1R.fastq.gz");
+    let r2 = fixture("sam2R.fastq.gz");
+
+    let fwd = dir.join("pseudo_fwd");
+    let rev = dir.join("pseudo_rev");
+    for (ins, out) in [([&f1, &f2], &fwd), ([&r1, &r2], &rev)] {
+        run(&[
+            "dada-pseudo",
+            ins[0].to_str().unwrap(),
+            ins[1].to_str().unwrap(),
+            "--error-model",
+            err.to_str().unwrap(),
+            "--output-dir",
+            out.to_str().unwrap(),
+            "--threads",
+            "1",
+        ]);
+    }
+
+    // make-sequence-table directly on dada-pseudo per-sample JSONs.
+    let seqtab = dir.join("seqtab.json");
+    run(&[
+        "make-sequence-table",
+        fwd.join("sam1F.json").to_str().unwrap(),
+        fwd.join("sam2F.json").to_str().unwrap(),
+        "-o",
+        seqtab.to_str().unwrap(),
+    ]);
+
+    // merge-pairs on dada-pseudo forward + reverse output.
+    let merged = dir.join("merged.json");
+    run(&[
+        "merge-pairs",
+        "--fwd-dada",
+        fwd.join("sam1F.json").to_str().unwrap(),
+        fwd.join("sam2F.json").to_str().unwrap(),
+        "--rev-dada",
+        rev.join("sam1R.json").to_str().unwrap(),
+        rev.join("sam2R.json").to_str().unwrap(),
+        "--fwd-fastq",
+        f1.to_str().unwrap(),
+        f2.to_str().unwrap(),
+        "--rev-fastq",
+        r1.to_str().unwrap(),
+        r2.to_str().unwrap(),
+        "-o",
+        merged.to_str().unwrap(),
+    ]);
+}
+
 #[test]
 fn dada_multi_input_matches_per_file_runs() {
     let dir = scratch("multi");

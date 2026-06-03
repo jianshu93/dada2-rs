@@ -339,12 +339,12 @@ pub fn merge_sample(
     pool: &rayon::ThreadPool,
 ) -> io::Result<SampleMergeResult> {
     // ---- Load dada JSONs (plain or gzip-compressed) ----
-    // Accept both "dada" (independent) and "dada-pooled" output — same schema.
+    // Accept "dada" (independent), "dada-pooled", and "dada-pseudo" — same schema.
     let fwd_dada: DadaJsonInput =
-        crate::misc::read_tagged_json(fwd_dada_path, &["dada", "dada-pooled"])
+        crate::misc::read_tagged_json(fwd_dada_path, &["dada", "dada-pooled", "dada-pseudo"])
             .with_path(fwd_dada_path)?;
     let rev_dada: DadaJsonInput =
-        crate::misc::read_tagged_json(rev_dada_path, &["dada", "dada-pooled"])
+        crate::misc::read_tagged_json(rev_dada_path, &["dada", "dada-pooled", "dada-pseudo"])
             .with_path(rev_dada_path)?;
 
     if params.check_sample_ids {
