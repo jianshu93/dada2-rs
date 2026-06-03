@@ -132,20 +132,37 @@ if (platform == "illumina") {
 ## =========================================================================
 } else if (platform == "pacbio") {
   band <- getn("band", 32); homo <- getn("homo_gap", -1)
-  if (step == "filter") {
-    input   <- getv("input"); if (is.null(input)) stop("filter needs input=")
-    min_len <- getn("min_len", 1000); max_len <- getn("max_len", 1600)
-    max_ee  <- getn("max_ee", 2); trunc_q <- getn("trunc_q", 0); max_n <- getn("max_n", 0)
-    filt_dir <- sp("filtered_R"); dir.create(filt_dir, showWarnings = FALSE)
+  if (step == "remove_primers") {
+    input   <- getv("input"); if (is.null(input)) stop("remove_primers needs input=")
+    pfwd <- getv("primer_fwd"); prev <- getv("primer_rev")
+    if (is.null(pfwd) || is.null(prev)) stop("remove_primers needs primer_fwd= and primer_rev=")
+    mm <- getn("max_mismatch", 2)
+    nop_dir <- sp("noprimers_R"); dir.create(nop_dir, showWarnings = FALSE)
+    rc <- utils::getFromNamespace("rc", "dada2")   # dada2's reverse-complement helper
 
     fns <- sort(list.files(input, pattern = "\\.f(ast)?q(\\.gz)?$", full.names = TRUE))
     if (length(fns) == 0) stop("no reads found")
     sample.names <- sub("\\.(fastq|fq)(\\.gz)?$", "", basename(fns))
-    filts <- file.path(filt_dir, paste0(sample.names, "_filt.fastq.gz"))
-    timed("filter", filterAndTrim(fns, filts, minLen = min_len, maxLen = max_len,
+    nops <- file.path(nop_dir, paste0(sample.names, "_noprimer.fastq.gz"))
+    # primer.rev is supplied 5'->3' (catalog); removePrimers expects it in the
+    # orientation it appears in reads, i.e. reverse-complemented.
+    timed("remove_primers", removePrimers(fns, nops, primer.fwd = pfwd,
+                                          primer.rev = rc(prev), orient = TRUE,
+                                          max.mismatch = mm, verbose = TRUE))
+    saveRDS(list(sample.names = sample.names, nops = nops), sp("manifest.rds"))
+
+  } else if (step == "filter") {
+    m <- readRDS(sp("manifest.rds"))
+    min_len <- getn("min_len", 1000); max_len <- getn("max_len", 1600)
+    max_ee  <- getn("max_ee", 2); trunc_q <- getn("trunc_q", 0); max_n <- getn("max_n", 0)
+    filt_dir <- sp("filtered_R"); dir.create(filt_dir, showWarnings = FALSE)
+
+    filts <- file.path(filt_dir, paste0(m$sample.names, "_filt.fastq.gz"))
+    timed("filter", filterAndTrim(m$nops, filts, minLen = min_len, maxLen = max_len,
                                   maxN = max_n, maxEE = max_ee, truncQ = trunc_q,
                                   rm.phix = FALSE, compress = TRUE, multithread = multithread))
-    saveRDS(list(sample.names = sample.names, filts = filts), sp("manifest.rds"))
+    m$filts <- filts
+    saveRDS(m, sp("manifest.rds"))
 
   } else if (step == "learn") {
     m <- readRDS(sp("manifest.rds"))

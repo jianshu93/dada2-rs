@@ -110,6 +110,9 @@ if (platform == "illumina") {
   max_n   <- getn("max_n", 0)
   band    <- getn("band", 32)
   homo    <- getn("homo_gap", -1)
+  pfwd    <- getv("primer_fwd"); prev <- getv("primer_rev")
+  mm      <- getn("max_mismatch", 2)
+  if (is.null(pfwd) || is.null(prev)) stop("pacbio needs primer_fwd= and primer_rev=")
 
   fns <- sort(list.files(input, pattern = "\\.fastq(\\.gz)?$|\\.fq(\\.gz)?$",
                          full.names = TRUE))
@@ -117,9 +120,17 @@ if (platform == "illumina") {
   sample.names <- sub("\\.(fastq|fq)(\\.gz)?$", "", basename(fns))
   cat(sprintf("pacbio: %d samples\n", length(fns)))
 
+  nop_dir <- file.path(outdir, "noprimers_R"); dir.create(nop_dir, showWarnings = FALSE)
+  nops  <- file.path(nop_dir, paste0(sample.names, "_noprimer.fastq.gz"))
   filts <- file.path(filt_dir, paste0(sample.names, "_filt.fastq.gz"))
+  rc <- utils::getFromNamespace("rc", "dada2")
 
-  timed("filter", filterAndTrim(fns, filts, minLen = min_len, maxLen = max_len,
+  # primer.rev supplied 5'->3' (catalog); removePrimers wants it RC'd.
+  timed("remove_primers", removePrimers(fns, nops, primer.fwd = pfwd,
+                                        primer.rev = rc(prev), orient = TRUE,
+                                        max.mismatch = mm, verbose = TRUE))
+
+  timed("filter", filterAndTrim(nops, filts, minLen = min_len, maxLen = max_len,
                                 maxN = max_n, maxEE = max_ee, truncQ = trunc_q,
                                 rm.phix = FALSE, compress = TRUE,
                                 multithread = multithread))

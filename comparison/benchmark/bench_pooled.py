@@ -9,9 +9,11 @@ symmetric side-by-side table.
 Two platforms:
   illumina : paired-end. filter -> learn(F,R) -> dada-pooled(F,R) ->
              merge-pairs -> make-sequence-table -> remove-bimera-denovo
-  pacbio   : single-end long reads. filter -> learn(pacbio errfun) ->
-             dada-pooled(band 32, homo-gap -1, k=7) -> make-sequence-table ->
-             remove-bimera-denovo
+  pacbio   : single-end long reads. remove-primers(+orient+filter) ->
+             learn(pacbio errfun, k=7) -> dada-pooled(band 32, homo-gap -1, k=7)
+             -> make-sequence-table -> remove-bimera-denovo. (R does primer
+             removal and filtering as two steps: removePrimers -> filterAndTrim.)
+             Input is RAW, primered reads; pass --primer-fwd/--primer-rev.
 
 PER-STEP timing AND peak RSS for BOTH stacks. Every step runs as its own
 process and is wrapped with os.wait4(): ru_maxrss is the kernel's peak
@@ -55,7 +57,9 @@ REPO = HERE.parent.parent   # comparison/benchmark/ -> repo root
 R_STEPS = {
     "illumina": ["filter", "learn_fwd", "learn_rev", "dada_fwd", "dada_rev",
                  "merge", "make_table", "remove_bimera"],
-    "pacbio": ["filter", "learn", "dada", "make_table", "remove_bimera"],
+    # R does primer removal and filtering as two functions (removePrimers ->
+    # filterAndTrim); the dada2-rs side consolidates both into remove-primers.
+    "pacbio": ["remove_primers", "filter", "learn", "dada", "make_table", "remove_bimera"],
 }
 
 
@@ -159,17 +163,23 @@ def rust_pacbio(args, bin_, outdir, results):
                    if re.search(r"\.f(ast)?q(\.gz)?$", f))
     if not reads:
         sys.exit(f"no reads in {args.input}")
+    # Consolidated remove-primers: trims primers, orients, AND applies the same
+    # length/quality filters as filter-and-trim, in one pass. This mirrors R's
+    # removePrimers() + filterAndTrim() (two functions) as a single dada2-rs step.
     filts = []
     for f in reads:
         name = re.sub(r"\.(fastq|fq)(\.gz)?$", "", os.path.basename(f))
         ff = filt / f"{name}_filt.fastq.gz"
         filts.append(ff)
-        run_step(f"filter:{name}", [bin_, "filter-and-trim",
-                 "--fwd", f, "--filt", ff,
+        run_step(f"remove_primers:{name}", [bin_, "remove-primers", f,
+                 "--fout", ff, "--primer-fwd", args.primer_fwd,
+                 "--primer-rev", args.primer_rev, "--max-mismatch", str(args.max_mismatch),
+                 "--trim-fwd", "--trim-rev", "--orient",
                  "--min-len", str(int(args.min_len)), "--max-len", str(int(args.max_len)),
                  "--max-n", str(args.max_n), "--max-ee", str(args.max_ee.split(",")[0]),
-                 "--trunc-q", str(args.trunc_q), "--compress"],
-                 outdir / f"filter_{name}.log", results)
+                 "--trunc-q", str(args.trunc_q), "--compress",
+                 "-o", outdir / f"primers_{name}.json"],
+                 outdir / f"primers_{name}.log", results)
 
     err = outdir / "errors_pacbio.json"
     run_step("learn", [bin_, "learn-errors", *map(str, filts),
@@ -198,15 +208,19 @@ def rust_pacbio(args, bin_, outdir, results):
 # R DADA2 pipeline — one Rscript process per step (symmetric per-step RSS)
 # --------------------------------------------------------------------------
 def r_common_args(args, statedir):
+    # Illumina maxEE is paired (e.g. "2,2"); PacBio is a single value.
+    mee = args.max_ee if args.platform == "illumina" else args.max_ee.split(",")[0]
     a = [f"platform={args.platform}", f"statedir={statedir}",
          f"threads={args.threads}", f"nbases={args.nbases}", f"input={args.input}",
-         f"max_ee={args.max_ee}", f"trunc_q={args.trunc_q}", f"max_n={args.max_n}"]
+         f"max_ee={mee}", f"trunc_q={args.trunc_q}", f"max_n={args.max_n}"]
     if args.platform == "illumina":
         a += [f"fwd_pattern={args.fwd_pattern}", f"rev_pattern={args.rev_pattern}",
               f"trunc_len={args.trunc_len}"]
     else:
         a += [f"min_len={args.min_len}", f"max_len={args.max_len}",
-              f"band={args.band}", f"homo_gap={args.homo_gap}"]
+              f"band={args.band}", f"homo_gap={args.homo_gap}",
+              f"primer_fwd={args.primer_fwd}", f"primer_rev={args.primer_rev}",
+              f"max_mismatch={args.max_mismatch}"]
     return a
 
 
@@ -239,15 +253,18 @@ def run_r_single(args, outdir):
     """
     rscript = args.rscript or "Rscript"
     rdir = outdir / "Rsingle"; rdir.mkdir(parents=True, exist_ok=True)
+    mee = args.max_ee if args.platform == "illumina" else args.max_ee.split(",")[0]
     a = [f"platform={args.platform}", f"input={args.input}", f"outdir={rdir}",
          f"threads={args.threads}", f"nbases={args.nbases}",
-         f"max_ee={args.max_ee}", f"trunc_q={args.trunc_q}", f"max_n={args.max_n}"]
+         f"max_ee={mee}", f"trunc_q={args.trunc_q}", f"max_n={args.max_n}"]
     if args.platform == "illumina":
         a += [f"fwd_pattern={args.fwd_pattern}", f"rev_pattern={args.rev_pattern}",
               f"trunc_len={args.trunc_len}"]
     else:
         a += [f"min_len={args.min_len}", f"max_len={args.max_len}",
-              f"band={args.band}", f"homo_gap={args.homo_gap}"]
+              f"band={args.band}", f"homo_gap={args.homo_gap}",
+              f"primer_fwd={args.primer_fwd}", f"primer_rev={args.primer_rev}",
+              f"max_mismatch={args.max_mismatch}"]
     log = outdir / "r_single.log"
     if log.exists():
         log.unlink()
@@ -270,15 +287,20 @@ def fmt_rss(kb):
 
 
 def collapse(results):
-    """Collapse per-sample filter:* rows into a single 'filter' row; keep order."""
-    filt = [r for r in results if r["step"].startswith("filter")]
-    rows = []
-    if filt:
-        rows.append({"step": "filter",
-                     "wall_s": sum(r["wall_s"] for r in filt),
-                     "maxrss_kb": max(r["maxrss_kb"] for r in filt)})
-    rows += [r for r in results if not r["step"].startswith("filter")]
-    return rows
+    """Collapse per-sample 'name:sample' rows into one 'name' row (sum wall, max
+    RSS), preserving first-seen order. Non-namespaced steps pass through."""
+    grouped, out = {}, []
+    for r in results:
+        if ":" in r["step"]:
+            key = r["step"].split(":", 1)[0]
+            if key not in grouped:
+                grouped[key] = {"step": key, "wall_s": 0.0, "maxrss_kb": 0.0}
+                out.append(grouped[key])
+            grouped[key]["wall_s"] += r["wall_s"]
+            grouped[key]["maxrss_kb"] = max(grouped[key]["maxrss_kb"], r["maxrss_kb"])
+        else:
+            out.append(r)
+    return out
 
 
 def print_stack(label, results, cf):
@@ -325,8 +347,17 @@ def main():
     p.add_argument("--band", type=int, default=32)
     p.add_argument("--homo-gap", type=int, default=-1)
     p.add_argument("--kmer-size", type=int, default=7)
+    # PacBio primer removal (mirrors removePrimers); defaults are 27F / 1492R
+    p.add_argument("--primer-fwd", default="AGRGTTYGATYMTGGCTCAG",
+                   help="forward primer, 5'->3' (PacBio; default 27F)")
+    p.add_argument("--primer-rev", default="RGYTACCTTGTTACGACTT",
+                   help="reverse primer, 5'->3' catalog direction (PacBio; default 1492R)")
+    p.add_argument("--max-mismatch", type=int, default=2,
+                   help="max mismatches when matching each primer")
     # shared filter params
-    p.add_argument("--max-ee", default="2,2", help="single value or F,R")
+    p.add_argument("--max-ee", default=None,
+                   help="max expected errors. Default: '2,2' for illumina "
+                        "(per-direction F,R), '2' for pacbio (single-end)")
     p.add_argument("--trunc-q", type=int, default=None,
                    help="default: 2 for illumina, 0 for pacbio")
     p.add_argument("--max-n", type=int, default=0)
@@ -334,6 +365,8 @@ def main():
 
     if args.trunc_q is None:
         args.trunc_q = 2 if args.platform == "illumina" else 0
+    if args.max_ee is None:
+        args.max_ee = "2,2" if args.platform == "illumina" else "2"
 
     outdir = Path(args.outdir).resolve()
     outdir.mkdir(parents=True, exist_ok=True)
