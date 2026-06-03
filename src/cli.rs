@@ -27,6 +27,7 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Commands {
     /// Compute per-position quality metrics from a FASTQ file
+    #[command(display_order = 1)]
     Summary {
         /// Input FASTQ file (uncompressed or gzipped)
         input: PathBuf,
@@ -58,6 +59,7 @@ pub enum Commands {
     /// Produces the equivalent of the R dada2 `derep` class: a set of unique
     /// sequences with read counts, per-unique mean quality profiles, and a
     /// read-to-unique mapping.
+    #[command(display_order = 4)]
     Derep {
         /// Input FASTQ file (uncompressed or gzipped)
         input: PathBuf,
@@ -103,6 +105,7 @@ pub enum Commands {
     ///
     /// By default `err_out` from the error model file is used as the error
     /// matrix.  Pass `--use-err-in` to use `err_in` instead.
+    #[command(display_order = 8)]
     Dada {
         /// Input file: FASTQ (uncompressed or gzipped) or a derep/sample JSON.
         input: PathBuf,
@@ -260,6 +263,7 @@ pub enum Commands {
     /// DADA2 is run once on the merged table, and one JSON file per sample is
     /// written into the output directory containing only the ASVs present in
     /// that sample.
+    #[command(display_order = 9)]
     DadaPooled {
         /// One or more input files — FASTQ (.fastq/.fastq.gz) or derep/sample JSON
         #[arg(required = true)]
@@ -378,6 +382,7 @@ pub enum Commands {
     ///     --rev-dada rev_dada/*.json \
     ///     --fwd-fastq fwd_fastq/*.fastq.gz \
     ///     --rev-fastq rev_fastq/*.fastq.gz
+    #[command(display_order = 10)]
     MergePairs {
         /// Forward dada JSON files
         #[arg(long, required = true, num_args = 1..)]
@@ -461,6 +466,7 @@ pub enum Commands {
     ///
     /// Outputs a trimmed FASTQ file; JSON stats (reads_in / reads_out) go to
     /// stdout or the file given by `-o`.
+    #[command(display_order = 2)]
     RemovePrimers {
         /// Input FASTQ file (uncompressed or gzipped)
         input: PathBuf,
@@ -601,6 +607,7 @@ pub enum Commands {
     /// For parameters that accept paired values (`--trunc-len`, `--trim-left`,
     /// etc.) provide either one value (applied to both directions) or two
     /// space-separated values (first for forward, second for reverse).
+    #[command(display_order = 3)]
     FilterAndTrim {
         /// Forward (R1) input FASTQ file
         #[arg(long, required = true)]
@@ -706,6 +713,7 @@ pub enum Commands {
     ///
     /// Reads one or more JSON files produced by the `dada` or `merge-pairs`
     /// subcommands and assembles a flat count matrix (samples × sequences).
+    #[command(display_order = 11)]
     MakeSequenceTable {
         /// One or more JSON files from `dada` (one file per sample) or
         /// `merge-pairs` (one file containing multiple samples).
@@ -754,6 +762,7 @@ pub enum Commands {
     /// Reads a JSON file produced by `make-sequence-table` and removes sequences
     /// identified as bimeras (chimeras of two more-abundant parents).
     /// Mirrors R's `removeBimeraDenovo`.
+    #[command(display_order = 12)]
     RemoveBimeraDenovo {
         /// Sequence table JSON produced by `make-sequence-table`
         input: PathBuf,
@@ -816,6 +825,7 @@ pub enum Commands {
     /// Pass `--prevalence` and/or `--min-abundance` to filter rows the same
     /// way R DADA2's pseudo-pooling selects priors
     /// (`colSums(st>0) >= PSEUDO_PREVALENCE | colSums(st) >= PSEUDO_ABUNDANCE`).
+    #[command(display_order = 15)]
     SeqTableToTsv {
         /// Sequence table JSON produced by `make-sequence-table` or `remove-bimera-denovo`
         input: PathBuf,
@@ -848,6 +858,7 @@ pub enum Commands {
     /// array — one entry per query — containing the sequence, its assigned
     /// taxonomy (null where confidence is below `--min-boot`), and optionally
     /// the raw bootstrap counts.
+    #[command(display_order = 13)]
     AssignTaxonomy {
         /// Query sequences: FASTA (.fa/.fa.gz/.fasta) or sequence-table JSON
         input: PathBuf,
@@ -913,6 +924,7 @@ pub enum Commands {
     /// accession, genus, species, e.g.
     ///
     ///   >AY123456 Staphylococcus aureus
+    #[command(display_order = 14)]
     AssignSpecies {
         /// Taxonomy JSON produced by `assign-taxonomy`
         input: PathBuf,
@@ -949,6 +961,7 @@ pub enum Commands {
     /// Emits one row per assignment with the sequence ID first, followed by
     /// one column per taxonomic level in the order they appear in the input
     /// JSON.  Unassigned levels are written as `NA` (matching R DADA2 output).
+    #[command(display_order = 17)]
     TaxToTsv {
         /// JSON file produced by `assign-taxonomy` or `assign-species`
         input: PathBuf,
@@ -970,6 +983,7 @@ pub enum Commands {
     /// `pool="pseudo"` selection rule
     /// `colSums(st>0) >= PSEUDO_PREVALENCE | colSums(st) >= PSEUDO_ABUNDANCE`),
     /// pass `--prevalence` and/or `--min-abundance`.
+    #[command(display_order = 16)]
     SeqTableToFasta {
         /// JSON file produced by the `make-sequence-table` subcommand
         input: PathBuf,
@@ -999,6 +1013,7 @@ pub enum Commands {
     ///
     /// Each output file uses the same format as the `derep` subcommand and can
     /// be passed directly to `errors-from-sample`.
+    #[command(display_order = 5)]
     Sample {
         /// One or more FASTQ files (.fastq, .fastq.gz, .fq, .fq.gz) to process
         #[arg(required = true)]
@@ -1048,6 +1063,7 @@ pub enum Commands {
     ///   `trans`   — accumulated transition counts,
     ///   `err_in`  — error rates used in the final DADA run,
     ///   `err_out` — error rates estimated from `trans`.
+    #[command(display_order = 7)]
     ErrorsFromSample {
         /// One or more derep JSON files produced by `sample` or `derep`
         #[arg(required = true)]
@@ -1272,6 +1288,7 @@ pub enum Commands {
     ///   `trans`   — accumulated transition counts,
     ///   `err_in`  — error rates used in the final DADA run,
     ///   `err_out` — error rates estimated from `trans`.
+    #[command(display_order = 6)]
     LearnErrors {
         /// One or more FASTQ files (.fastq, .fastq.gz, .fq, .fq.gz) to learn from
         #[arg(required = true)]
