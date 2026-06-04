@@ -1334,7 +1334,11 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&script, perms).unwrap();
 
-        let cmd = script.to_string_lossy().into_owned();
+        // Invoke via `/bin/sh <script>` rather than exec'ing the script file
+        // directly: tests run in parallel, and exec'ing a just-written file can
+        // race with another test's fork() and fail with ETXTBSY ("Text file
+        // busy") on Linux. Running it through sh only *reads* the script.
+        let cmd = format!("/bin/sh {}", script.to_string_lossy());
         let err = external_errfun(&trans, nq, &cmd).expect("external errfun should succeed");
         assert_eq!(err.len(), 16 * nq);
         for v in &err {
@@ -1357,7 +1361,9 @@ mod tests {
         std::fs::set_permissions(&script, perms).unwrap();
 
         let trans = vec![0u32; 16 * 4];
-        let result = external_errfun(&trans, 4, &script.to_string_lossy());
+        // Run via `/bin/sh <script>` to avoid the parallel-test ETXTBSY race
+        // (see test_external_errfun_roundtrip).
+        let result = external_errfun(&trans, 4, &format!("/bin/sh {}", script.to_string_lossy()));
         let err_msg = result.expect_err("script exits 7 — should fail");
         assert!(err_msg.contains("exited with"), "got: {err_msg}");
         assert!(
@@ -1387,7 +1393,9 @@ mod tests {
         std::fs::set_permissions(&script, perms).unwrap();
 
         let trans = vec![0u32; 16 * 4];
-        let result = external_errfun(&trans, 4, &script.to_string_lossy());
+        // Run via `/bin/sh <script>` to avoid the parallel-test ETXTBSY race
+        // (see test_external_errfun_roundtrip).
+        let result = external_errfun(&trans, 4, &format!("/bin/sh {}", script.to_string_lossy()));
         let err_msg = result.expect_err("1.5 is not a valid probability");
         assert!(
             err_msg.contains("not a valid probability"),
