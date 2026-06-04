@@ -8,8 +8,9 @@ Two denoising modes via --pool:
   true  (default): POOLED — R `pool=TRUE` / dada2-rs `dada-pooled`. One giant
                    inference over all samples; the worst case for runtime/memory.
   false          : PER-SAMPLE — R `pool=FALSE` (multithread across samples) /
-                   dada2-rs per-sample `dada` fanned across workers. The regime
-                   where independent small inferences favor dada2-rs most.
+                   dada2-rs multi-input `dada` (one process, --sample-jobs across
+                   samples). The regime where independent inferences favor
+                   dada2-rs most.
   pseudo         : PSEUDO-POOLING — R `dada(pool="pseudo")` vs dada2-rs
                    `dada-pseudo` (one call each). dada-pseudo runs samples
                    serially while R parallelizes across them, so pseudo
@@ -37,8 +38,8 @@ in kB; macOS in bytes; we normalize to kB.)
 For a focused scaling study, --thread-sweep N,N,... prepares inputs once
 (filter+learn) then runs ONLY the denoise step at each thread count, reporting
 wall / cores / speedup / parallel efficiency (dada2-rs only; skips R).
---sample-jobs-sweep N,N,... does the same at FIXED --threads, varying pseudo's
---sample-jobs (samples-in-flight) to find the best wall_s.
+--sample-jobs-sweep N,N,... does the same at FIXED --threads, varying
+--sample-jobs (samples-in-flight; pseudo or false) to find the best wall_s.
 
 The R side is run step-by-step (each its own `Rscript bench_step.R` process,
 state passed via .rds files) precisely so its per-step RSS is comparable to the
@@ -153,12 +154,15 @@ def run_phase_concurrent(name, jobs, results, max_workers):
 # --------------------------------------------------------------------------
 def rust_dada_step(args, bin_, step, filts, names, errmodel, ddir, outdir, results,
                    extra=(), threads=None, sample_jobs="default"):
-    """Denoise. pool=true -> one dada-pooled call; pool=pseudo -> one dada-pseudo
-    call; pool=false -> per-sample dada fanned across workers (mirrors R
-    dada(pool=FALSE, multithread=N)). Either way ddir ends up with one JSON per
-    sample and the phase records a single row. `threads` overrides args.threads
-    (thread-sweep); `sample_jobs` overrides the pseudo --sample-jobs (jobs-sweep);
-    "default" means use args.sample_jobs (None -> let dada-pseudo decide)."""
+    """Denoise as a single dada2-rs call, the direct analog of the R function:
+    pool=true -> dada-pooled (R pool=TRUE); pool=false -> multi-input dada (R
+    pool=FALSE); pool=pseudo -> dada-pseudo (R pool="pseudo"). All three are one
+    process using in-process across-sample concurrency (--sample-jobs), so the
+    comparison is function-vs-function, not harness-vs-harness. ddir ends up with
+    one JSON per sample and the phase records a single row. `threads` overrides
+    args.threads (thread-sweep); `sample_jobs` overrides --sample-jobs
+    (jobs-sweep); "default" means use args.sample_jobs (None -> let the command
+    pick round(threads/4))."""
     t = args.threads if threads is None else threads
     sj = args.sample_jobs if sample_jobs == "default" else sample_jobs
     if args.pool == "true":
@@ -176,12 +180,14 @@ def rust_dada_step(args, bin_, step, filts, names, errmodel, ddir, outdir, resul
             cmd += ["--sample-jobs", str(sj)]
         run_step(step, cmd, outdir / f"{step}.log", results)
     else:
-        jobs = []
-        for fp, name in zip(filts, names):
-            jobs.append(([bin_, "dada", str(fp), "--error-model", str(errmodel),
-                          *extra, "-o", ddir / f"{name}.json"],
-                         outdir / f"{step}_{name}.log"))
-        run_phase_concurrent(step, jobs, results, t)
+        # Multi-input dada: one process, per-sample (R pool=FALSE), fanning
+        # samples in-process via --sample-jobs (mirrors how pseudo is run).
+        cmd = [bin_, "dada", *map(str, filts),
+               "--error-model", errmodel, "--output-dir", ddir, *extra,
+               "--threads", str(t)]
+        if sj is not None:
+            cmd += ["--sample-jobs", str(sj)]
+        run_step(step, cmd, outdir / f"{step}.log", results)
 
 
 def prepare_illumina(args, bin_, outdir, results):
@@ -382,13 +388,14 @@ def thread_sweep(args, bin_, outdir):
 
 
 def sample_jobs_sweep(args, bin_, outdir):
-    """Prepare inputs ONCE, then run the pseudo DENOISE step at FIXED --threads
-    for each --sample-jobs value, to find the best samples-in-flight. Read the
-    minimum wall_s (the optimum) and watch cpu_s climb back up when the sub-pools
-    get too small (per-map overhead returns). pseudo only; dada2-rs only."""
-    if args.pool != "pseudo":
-        sys.exit("--sample-jobs-sweep only applies to --pool pseudo "
-                 "(only dada-pseudo has --sample-jobs)")
+    """Prepare inputs ONCE, then run the DENOISE step at FIXED --threads for each
+    --sample-jobs value, to find the best samples-in-flight. Read the minimum
+    wall_s (the optimum) and watch cpu_s climb back up when the sub-pools get too
+    small (per-map overhead returns). pseudo or false (both have --sample-jobs);
+    dada2-rs only."""
+    if args.pool not in ("pseudo", "false"):
+        sys.exit("--sample-jobs-sweep only applies to --pool pseudo or false "
+                 "(dada-pooled has no --sample-jobs)")
     sweep = [int(j) for j in args.sample_jobs_sweep.split(",")]
     prep = _prepare_for_sweep(args, bin_, outdir)
     rows = []
@@ -404,7 +411,7 @@ def sample_jobs_sweep(args, bin_, outdir):
     base_w = rows[0]["wall_s"]
     best = min(rows, key=lambda r: r["wall_s"])
     print("\n" + "=" * 68)
-    print(f"SAMPLE-JOBS SWEEP — {args.platform} pseudo denoise, {args.threads} threads")
+    print(f"SAMPLE-JOBS SWEEP — {args.platform} {args.pool} denoise, {args.threads} threads")
     print("=" * 68)
     print(f"  {'jobs':>6}{'~t/job':>8}{'wall_s':>10}{'cpu_s':>10}{'cores':>8}"
           f"{'peak_rss':>11}{'speedup':>9}")
@@ -421,7 +428,7 @@ def sample_jobs_sweep(args, bin_, outdir):
                      f"{r['cores']:.2f},{r['maxrss_kb']:.0f},{speedup:.3f}\n")
     print(f"\n  best wall: {best['jobs']} job(s) ({max(1, args.threads // best['jobs'])} "
           f"threads/job) at {best['wall_s']:.1f}s, {fmt_rss(best['maxrss_kb'])} peak")
-    print("  (peak_rss is the max single dada-pseudo process; more jobs = more "
+    print("  (peak_rss is the max single denoise process; more jobs = more "
           "concurrent working sets = higher peak)")
     print(f"  Wrote {csv_path}")
 
@@ -568,7 +575,8 @@ def main():
     p.add_argument("--pool", choices=["true", "false", "pseudo"], default="true",
                    help="denoising mode: 'true' = pooled (R pool=TRUE / dada-pooled, "
                         "the worst case); 'false' = per-sample (R pool=FALSE / "
-                        "per-sample dada run concurrently); 'pseudo' = pseudo-pooling "
+                        "multi-input dada, one process with --sample-jobs); 'pseudo' "
+                        "= pseudo-pooling "
                         "(R dada(pool=\"pseudo\") vs dada2-rs dada-pseudo, one call each). "
                         "Default true. Note: dada-pseudo runs samples serially while R "
                         "parallelizes across them, so pseudo wall-time favors R at high "
@@ -580,18 +588,19 @@ def main():
                    help="pseudo: min total abundance to seed a prior (R PSEUDO_ABUNDANCE). "
                         "Default off (R's Inf)")
     p.add_argument("--sample-jobs", type=int, default=None,
-                   help="pseudo: samples denoised concurrently (passed to dada-pseudo "
-                        "--sample-jobs). Default: let dada-pseudo decide (round(threads/8))")
+                   help="pseudo/false: samples denoised concurrently (passed to "
+                        "dada-pseudo / multi-input dada --sample-jobs). Default: let "
+                        "the command decide (round(threads/4))")
     p.add_argument("--thread-sweep", default=None, metavar="N,N,...",
                    help="dada2-rs-only scaling study: prepare inputs once (filter+learn), "
                         "then run only the denoise step at each comma-separated thread "
                         "count, reporting wall/cores/speedup/efficiency. Skips R and "
                         "downstream steps. e.g. --thread-sweep 1,2,4,8,16,24")
     p.add_argument("--sample-jobs-sweep", default=None, metavar="N,N,...",
-                   help="pseudo-only scaling study at FIXED --threads: prepare once, then "
-                        "run the denoise step at each --sample-jobs value to find the best "
-                        "samples-in-flight (min wall_s; watch cpu_s climb when sub-pools "
-                        "get too small). e.g. --sample-jobs-sweep 1,2,3,4,6,8")
+                   help="scaling study at FIXED --threads (--pool pseudo or false): prepare "
+                        "once, then run the denoise step at each --sample-jobs value to find "
+                        "the best samples-in-flight (min wall_s; watch cpu_s climb when "
+                        "sub-pools get too small). e.g. --sample-jobs-sweep 1,2,3,4,6,8")
     p.add_argument("--dada2rs", help="path to dada2-rs binary (REQUIRED; e.g. "
                    "target/release/dada2-rs or target/release-native/dada2-rs)")
     p.add_argument("--rscript", help="path to Rscript (default: Rscript on PATH)")
@@ -646,7 +655,7 @@ def main():
 
     if args.sample_jobs_sweep:
         bin_ = find_binary(args.dada2rs)
-        print(f"=== sample-jobs sweep: dada2-rs ({args.platform}, pseudo) — {bin_} ===",
+        print(f"=== sample-jobs sweep: dada2-rs ({args.platform}, {args.pool}) — {bin_} ===",
               flush=True)
         sample_jobs_sweep(args, bin_, outdir)
         return
