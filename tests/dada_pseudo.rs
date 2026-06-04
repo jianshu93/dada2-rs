@@ -270,6 +270,46 @@ fn dada_pseudo_output_feeds_downstream_steps() {
     ]);
 }
 
+/// dada-pseudo denoises samples with bounded across-sample concurrency
+/// (`--sample-jobs`). Per-sample `dada_uniques` is deterministic and round-1
+/// prior selection is a set union, so output must be byte-identical regardless
+/// of how many samples run concurrently (this also pins it to the serial path).
+#[test]
+fn dada_pseudo_is_deterministic_across_sample_jobs() {
+    let dir = scratch("pseudo_jobs");
+    let err = shared_err_model();
+    let s1 = fixture("sam1F.fastq.gz");
+    let s2 = fixture("sam2F.fastq.gz");
+
+    let run_jobs = |jobs: &str, out: &Path| {
+        run(&[
+            "dada-pseudo",
+            s1.to_str().unwrap(),
+            s2.to_str().unwrap(),
+            "--error-model",
+            err.to_str().unwrap(),
+            "--output-dir",
+            out.to_str().unwrap(),
+            "--pseudo-prevalence",
+            "2",
+            "--threads",
+            "4",
+            "--sample-jobs",
+            jobs,
+        ]);
+    };
+    let (j1, j2) = (dir.join("j1"), dir.join("j2"));
+    run_jobs("1", &j1);
+    run_jobs("2", &j2);
+    for sample in ["sam1F.json", "sam2F.json"] {
+        assert_eq!(
+            std::fs::read(j1.join(sample)).unwrap(),
+            std::fs::read(j2.join(sample)).unwrap(),
+            "dada-pseudo output for {sample} differs between --sample-jobs 1 and 2",
+        );
+    }
+}
+
 /// merge-pairs parallelizes across samples; `collect` preserves input order, so
 /// the output must be byte-identical regardless of thread count. (Same error
 /// model is reused for both directions — this checks determinism, not biology.)

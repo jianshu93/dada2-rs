@@ -431,6 +431,17 @@ pub enum Commands {
         #[arg(long, default_value_t = 1)]
         threads: usize,
 
+        /// Number of samples to denoise concurrently, each on its own
+        /// `threads / sample-jobs` sub-pool. A single sample's comparison map is
+        /// often too small to feed many threads, so fanning samples across
+        /// smaller sub-pools keeps every core fed (~8 threads/sample is the sweet
+        /// spot). Defaults to round(threads / 8) (1 at <=8 threads, i.e. the
+        /// original serial behavior). Trades a little peak memory (this many
+        /// concurrent working sets) for much better thread utilization; dial it
+        /// down for PacBio (k=7, larger per-sample state).
+        #[arg(long)]
+        sample_jobs: Option<usize>,
+
         /// Significance threshold for abundance-based cluster splitting (omega_a)
         #[arg(long)]
         omega_a: Option<f64>,

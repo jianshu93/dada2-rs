@@ -1142,6 +1142,7 @@ fn main() -> io::Result<()> {
             priors_out,
             phred_offset,
             threads,
+            sample_jobs,
             omega_a,
             omega_c,
             omega_p,
@@ -1158,8 +1159,15 @@ fn main() -> io::Result<()> {
             verbose,
         } => {
             use std::collections::{HashMap, HashSet};
+            use std::sync::Mutex;
 
             let n_samples = input.len();
+            // How many samples to denoise concurrently (each on a threads/jobs
+            // sub-pool). Default: round(threads/8), the sweep's sweet spot; 1 at
+            // <=8 threads reproduces the serial path.
+            let jobs = sample_jobs
+                .unwrap_or_else(|| ((threads as f64 / 8.0).round() as usize).max(1))
+                .clamp(1, n_samples.max(1));
             if let Some(ref names) = sample_names
                 && names.len() != n_samples
             {
@@ -1245,13 +1253,17 @@ fn main() -> io::Result<()> {
 
             // ---- Round 1: denoise each sample independently (no priors) ----
             if verbose {
-                eprintln!("[dada-pseudo] round 1: {n_samples} sample(s), no priors");
+                eprintln!(
+                    "[dada-pseudo] round 1: {n_samples} sample(s), no priors ({jobs} concurrent)"
+                );
             }
-            // Collect per-sample round-1 ASV (sequence, abundance) pairs.
-            let mut round1_asvs: Vec<Vec<(String, u32)>> = Vec::with_capacity(n_samples);
-            for (s, raws) in sample_raws.iter().enumerate() {
-                let result = pool
-                    .install(|| dada::dada_uniques(raws, &resolved.params))
+            // Denoise samples with bounded concurrency; collect (index, ASVs)
+            // unordered, then reassemble by sample (order is irrelevant to the
+            // prior-selection union but counts must stay attributed per sample).
+            let collected: Mutex<IndexedAsvs> = Mutex::new(Vec::with_capacity(n_samples));
+            for_each_sample_concurrent(n_samples, jobs, threads, |s, sub_pool| {
+                let result = sub_pool
+                    .install(|| dada::dada_uniques(&sample_raws[s], &resolved.params))
                     .map_err(io::Error::other)?;
                 let asvs: Vec<(String, u32)> = result
                     .clusters
@@ -1269,10 +1281,15 @@ fn main() -> io::Result<()> {
                     eprintln!(
                         "[dada-pseudo]   round 1 {}: {} ASV(s)",
                         sample_names[s],
-                        asvs.len(),
+                        asvs.len()
                     );
                 }
-                round1_asvs.push(asvs);
+                collected.lock().unwrap().push((s, asvs));
+                Ok(())
+            })?;
+            let mut round1_asvs: Vec<Vec<(String, u32)>> = vec![Vec::new(); n_samples];
+            for (s, asvs) in collected.into_inner().unwrap() {
+                round1_asvs[s] = asvs;
             }
 
             // ---- Build a sequence table from round-1 ASVs (samples × sequences) ----
@@ -1350,25 +1367,29 @@ fn main() -> io::Result<()> {
             }
 
             // ---- Round 2: re-denoise each sample with the priors flagged ----
-            if verbose {
-                eprintln!("[dada-pseudo] round 2: denoising with priors");
-            }
+            // Mark priors serially first (cheap) so the concurrent denoise only
+            // needs shared immutable access to `sample_raws`.
             for (s, sample_name) in sample_names.iter().enumerate() {
-                let raws = &mut sample_raws[s];
-                let n_marked = mark_priors(raws, &prior_set);
+                let n_marked = mark_priors(&mut sample_raws[s], &prior_set);
                 if verbose {
                     eprintln!(
                         "[dada-pseudo]   round 2 {sample_name}: {n_marked} of {} unique(s) flagged as prior",
-                        raws.len(),
+                        sample_raws[s].len(),
                     );
                 }
+            }
+            if verbose {
+                eprintln!("[dada-pseudo] round 2: denoising with priors ({jobs} concurrent)");
+            }
+            for_each_sample_concurrent(n_samples, jobs, threads, |s, sub_pool| {
+                let sample_name = &sample_names[s];
                 let json = denoise_and_serialize(
                     "dada-pseudo",
                     sample_name,
-                    raws,
+                    &sample_raws[s],
                     &resolved.params,
                     &resolved.run,
-                    &pool,
+                    sub_pool,
                     compact,
                     verbose,
                 )?;
@@ -1377,7 +1398,8 @@ fn main() -> io::Result<()> {
                 if verbose {
                     eprintln!("[dada-pseudo] wrote {}", out_path.display());
                 }
-            }
+                Ok(())
+            })?;
         }
 
         Commands::MergePairs {
@@ -3381,6 +3403,65 @@ fn resolve_dada_params(
     };
 
     Ok(ResolvedDada { params, nq, run })
+}
+
+/// Per-sample round-1 ASVs tagged with their sample index (collected unordered
+/// from the concurrent round-1 denoise, then reassembled by index).
+type IndexedAsvs = Vec<(usize, Vec<(String, u32)>)>;
+
+/// Run `f` over samples `0..n` with bounded across-sample concurrency: spawn
+/// `jobs` workers, each owning a rayon sub-pool of ~`threads / jobs` threads,
+/// pulling sample indices from a shared counter. `f` gets the worker's sub-pool
+/// so it can `sub_pool.install(|| dada_uniques(...))`, pinning the per-sample
+/// comparison map to that sub-pool. A single sample's map is often too small to
+/// feed many threads, so this keeps every core fed. `jobs == 1` reproduces the
+/// serial, full-pool behavior exactly. Returns the first error, if any.
+fn for_each_sample_concurrent(
+    n: usize,
+    jobs: usize,
+    threads: usize,
+    f: impl Fn(usize, &rayon::ThreadPool) -> io::Result<()> + Sync,
+) -> io::Result<()> {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let jobs = jobs.clamp(1, n.max(1));
+    // Split `threads` across `jobs` sub-pools, spreading the remainder so the
+    // pools differ by at most one thread (e.g. 20 threads / 3 jobs -> 7,7,6).
+    let base = (threads / jobs).max(1);
+    let rem = threads % jobs;
+    let pools: Vec<rayon::ThreadPool> = (0..jobs)
+        .map(|j| {
+            let t = if j < rem { base + 1 } else { base };
+            rayon::ThreadPoolBuilder::new().num_threads(t).build()
+        })
+        .collect::<Result<_, _>>()
+        .map_err(io::Error::other)?;
+
+    let next = AtomicUsize::new(0);
+    let err: Mutex<Option<io::Error>> = Mutex::new(None);
+    std::thread::scope(|scope| {
+        for pool in &pools {
+            let (next, err, f) = (&next, &err, &f);
+            scope.spawn(move || {
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= n || err.lock().unwrap().is_some() {
+                        break;
+                    }
+                    if let Err(e) = f(i, pool) {
+                        let mut slot = err.lock().unwrap();
+                        slot.get_or_insert(e);
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    match err.into_inner().unwrap() {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// Mark each RawInput whose (uppercased) sequence is in `prior_set` as a prior.
