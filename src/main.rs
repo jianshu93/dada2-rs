@@ -1163,10 +1163,13 @@ fn main() -> io::Result<()> {
 
             let n_samples = input.len();
             // How many samples to denoise concurrently (each on a threads/jobs
-            // sub-pool). Default: round(threads/8), the sweep's sweet spot; 1 at
-            // <=8 threads reproduces the serial path.
+            // sub-pool). Default: round(threads/4) ≈ 4 threads/sample, the
+            // aggregate-throughput sweet spot from the sample-jobs sweep (the
+            // wall-time curve plateaus there; more samples-in-flight fills cores
+            // better than the single-sample efficiency curve suggests). 1 at
+            // <=4 threads reproduces the serial path.
             let jobs = sample_jobs
-                .unwrap_or_else(|| ((threads as f64 / 8.0).round() as usize).max(1))
+                .unwrap_or_else(|| ((threads as f64 / 4.0).round() as usize).max(1))
                 .clamp(1, n_samples.max(1));
             if let Some(ref names) = sample_names
                 && names.len() != n_samples

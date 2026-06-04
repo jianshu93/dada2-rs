@@ -314,8 +314,9 @@ def rust_pacbio(args, bin_, outdir, results):
 # Thread-scaling sweep (dada2-rs only)
 # --------------------------------------------------------------------------
 def _denoise_measure(args, bin_, prep, tdir, threads, sample_jobs="default"):
-    """Run only the denoise step(s) into tdir at the given threads/sample_jobs;
-    return (wall_s, cpu_s) summed across fwd+rev (illumina) or the single call."""
+    """Run only the denoise step(s) into tdir at the given threads/sample_jobs.
+    Returns (wall_s, cpu_s, peak_rss_kb): wall/cpu summed across fwd+rev (illumina)
+    or the single call; peak_rss_kb is the max single-step peak RSS."""
     tdir.mkdir(exist_ok=True)
     res = []
     if args.platform == "illumina":
@@ -331,7 +332,9 @@ def _denoise_measure(args, bin_, prep, tdir, threads, sample_jobs="default"):
         rust_dada_step(args, bin_, "dada", prep["filts"], prep["names"], prep["err"],
                        dd, tdir, res, threads=threads, sample_jobs=sample_jobs,
                        extra=pacbio_dada_extra(args))
-    return sum(r["wall_s"] for r in res), sum(r.get("cpu_s", 0.0) for r in res)
+    return (sum(r["wall_s"] for r in res),
+            sum(r.get("cpu_s", 0.0) for r in res),
+            max((r["maxrss_kb"] for r in res), default=0))
 
 
 def _prepare_for_sweep(args, bin_, outdir):
@@ -353,7 +356,8 @@ def thread_sweep(args, bin_, outdir):
         # Pin sample_jobs=1 so this isolates single-sample thread scaling
         # (pseudo only; ignored for pooled/per-sample). Use --sample-jobs-sweep
         # to explore samples-in-flight at fixed threads.
-        wall, cpu = _denoise_measure(args, bin_, prep, outdir / f"t{t}", t, sample_jobs=1)
+        wall, cpu, _rss = _denoise_measure(args, bin_, prep, outdir / f"t{t}", t,
+                                           sample_jobs=1)
         rows.append({"threads": t, "wall_s": wall, "cpu_s": cpu,
                      "cores": cpu / wall if wall > 0 else 0.0})
 
@@ -392,30 +396,33 @@ def sample_jobs_sweep(args, bin_, outdir):
         tps = max(1, args.threads // j)
         print(f"\n=== denoise @ {j} sample-job(s) × ~{tps} thread(s), "
               f"{args.threads} total ===", flush=True)
-        wall, cpu = _denoise_measure(args, bin_, prep, outdir / f"j{j}",
-                                     args.threads, sample_jobs=j)
-        rows.append({"jobs": j, "wall_s": wall, "cpu_s": cpu,
+        wall, cpu, rss = _denoise_measure(args, bin_, prep, outdir / f"j{j}",
+                                          args.threads, sample_jobs=j)
+        rows.append({"jobs": j, "wall_s": wall, "cpu_s": cpu, "maxrss_kb": rss,
                      "cores": cpu / wall if wall > 0 else 0.0})
 
     base_w = rows[0]["wall_s"]
     best = min(rows, key=lambda r: r["wall_s"])
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 68)
     print(f"SAMPLE-JOBS SWEEP — {args.platform} pseudo denoise, {args.threads} threads")
-    print("=" * 60)
-    print(f"  {'jobs':>6}{'~t/job':>8}{'wall_s':>10}{'cpu_s':>10}{'cores':>8}{'speedup':>9}")
+    print("=" * 68)
+    print(f"  {'jobs':>6}{'~t/job':>8}{'wall_s':>10}{'cpu_s':>10}{'cores':>8}"
+          f"{'peak_rss':>11}{'speedup':>9}")
     csv_path = outdir / "sweep_jobs.csv"
     with open(csv_path, "w") as cf:
-        cf.write("sample_jobs,threads_per_job,wall_s,cpu_s,cores,speedup\n")
+        cf.write("sample_jobs,threads_per_job,wall_s,cpu_s,cores,maxrss_kb,speedup\n")
         for r in rows:
             tps = max(1, args.threads // r["jobs"])
             speedup = base_w / r["wall_s"] if r["wall_s"] > 0 else 0.0
             mark = "  <- fastest" if r is best else ""
             print(f"  {r['jobs']:>6}{tps:>8}{r['wall_s']:>10.2f}{r['cpu_s']:>10.1f}"
-                  f"{r['cores']:>8.1f}{speedup:>8.2f}×{mark}")
+                  f"{r['cores']:>8.1f}{fmt_rss(r['maxrss_kb']):>11}{speedup:>8.2f}×{mark}")
             cf.write(f"{r['jobs']},{tps},{r['wall_s']:.2f},{r['cpu_s']:.2f},"
-                     f"{r['cores']:.2f},{speedup:.3f}\n")
-    print(f"\n  best: {best['jobs']} job(s) ({max(1, args.threads // best['jobs'])} "
-          f"threads/job) at {best['wall_s']:.1f}s")
+                     f"{r['cores']:.2f},{r['maxrss_kb']:.0f},{speedup:.3f}\n")
+    print(f"\n  best wall: {best['jobs']} job(s) ({max(1, args.threads // best['jobs'])} "
+          f"threads/job) at {best['wall_s']:.1f}s, {fmt_rss(best['maxrss_kb'])} peak")
+    print("  (peak_rss is the max single dada-pseudo process; more jobs = more "
+          "concurrent working sets = higher peak)")
     print(f"  Wrote {csv_path}")
 
 

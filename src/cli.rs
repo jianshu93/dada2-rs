@@ -434,11 +434,12 @@ pub enum Commands {
         /// Number of samples to denoise concurrently, each on its own
         /// `threads / sample-jobs` sub-pool. A single sample's comparison map is
         /// often too small to feed many threads, so fanning samples across
-        /// smaller sub-pools keeps every core fed (~8 threads/sample is the sweet
-        /// spot). Defaults to round(threads / 8) (1 at <=8 threads, i.e. the
-        /// original serial behavior). Trades a little peak memory (this many
-        /// concurrent working sets) for much better thread utilization; dial it
-        /// down for PacBio (k=7, larger per-sample state).
+        /// smaller sub-pools keeps every core fed (~4 threads/sample is the sweet
+        /// spot — the sample-jobs sweep's wall-time curve plateaus there).
+        /// Defaults to round(threads / 4) (1 at <=4 threads, i.e. the original
+        /// serial behavior). Trades a little peak memory (this many concurrent
+        /// working sets) for much better thread utilization; dial it down for
+        /// PacBio (k=7, larger per-sample state) if memory is tight.
         #[arg(long)]
         sample_jobs: Option<usize>,
 
