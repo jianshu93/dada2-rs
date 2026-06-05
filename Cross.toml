@@ -1,0 +1,7 @@
+# Used by the `cross` tool for containerized cross-compilation (Linux ARM64 in
+# the Release workflow). `cross` runs the build inside a target-arch container,
+# so any env var our build needs must be explicitly passed through. RUSTFLAGS is
+# forwarded by default; DADA2_RS_VERSION_FULL (consumed by build.rs to embed the
+# version) is not, so we list it here.
+[build.env]
+passthrough = ["DADA2_RS_VERSION_FULL"]

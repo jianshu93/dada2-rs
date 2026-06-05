@@ -1,0 +1,141 @@
+name: Release
+
+# Build native binaries for common architectures on a tagged release and
+# attach them to the GitHub Release.
+#
+# Triggered by pushing a semver tag, e.g.:
+#   git tag v0.1.2 && git push origin v0.1.2
+#
+# CPU tuning: GitHub-hosted runners use generic CPUs, so we cannot tune to a
+# specific compute node's microarchitecture (target-cpu=native). The Linux
+# builds instead target x86-64-v3 (AVX2/BMI2, ~Haswell 2013+), which runs on
+# essentially all modern compute nodes while still enabling wide SIMD. The
+# Apple Silicon build uses the aarch64 baseline (already rich in NEON SIMD).
+# All builds use the release-native profile (thin LTO + codegen-units=1).
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            rustflags: "-C target-cpu=x86-64-v3"
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            rustflags: "-C target-cpu=x86-64-v3"
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            rustflags: ""
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            rustflags: ""
+            use_cross: true
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Compute version string
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Tag is vX.Y.Z -> strip leading "v".
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "Computed DADA2_RS_VERSION_FULL=${VERSION}"
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install cross
+        if: matrix.use_cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Cache cargo registry
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-release-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-release-${{ matrix.target }}-
+
+      - name: Build
+        env:
+          DADA2_RS_VERSION_FULL: ${{ steps.version.outputs.version }}
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: |
+          BUILD="${{ matrix.use_cross && 'cross' || 'cargo' }}"
+          "${BUILD}" build --profile release-native --target ${{ matrix.target }}
+
+      - name: Package
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+          TARGET="${{ matrix.target }}"
+          BIN="dada2-rs"
+          STAGE="dada2-rs-${VERSION}-${TARGET}"
+          mkdir "${STAGE}"
+          cp "target/${TARGET}/release-native/${BIN}" "${STAGE}/"
+          cp README.md LICENSE* "${STAGE}/" 2>/dev/null || true
+          tar -czf "${STAGE}.tar.gz" "${STAGE}"
+          sha256sum "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256" 2>/dev/null \
+            || shasum -a 256 "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256"
+          echo "archive=${STAGE}.tar.gz" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dada2-rs-${{ matrix.target }}
+          path: |
+            dada2-rs-*.tar.gz
+            dada2-rs-*.tar.gz.sha256
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/dada2-rs-*.tar.gz
+            artifacts/dada2-rs-*.tar.gz.sha256
+          generate_release_notes: true
+          fail_on_unmatched_files: true
