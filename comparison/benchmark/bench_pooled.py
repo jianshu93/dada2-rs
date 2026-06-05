@@ -288,7 +288,10 @@ def rust_illumina(args, bin_, outdir, results):
 def pacbio_dada_extra(args):
     extra = ["--band", str(args.band), "--kmer-size", str(args.kmer_size)]
     # Only pass --homo-gap-p when explicitly set; otherwise dada2-rs falls back to
-    # --gap-p (R's HOMOPOLYMER_GAP_PENALTY=NULL -> GAP_PENALTY semantics).
+    # --gap-p (R's HOMOPOLYMER_GAP_PENALTY=NULL -> GAP_PENALTY semantics). HiFi
+    # should leave it at default (HOMOPOLYMER_GAP_PENALTY=-1 is DADA2's 454 rec,
+    # not PacBio); maintainer confirms:
+    # https://github.com/benjjneb/dada2/issues/1663#issuecomment-1359905397
     if args.homo_gap is not None:
         extra += ["--homo-gap-p", str(args.homo_gap)]
     return extra
