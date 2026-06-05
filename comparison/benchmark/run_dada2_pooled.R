@@ -121,7 +121,8 @@ if (platform == "illumina") {
   trunc_q <- getn("trunc_q", 0)
   max_n   <- getn("max_n", 0)
   band    <- getn("band", 32)
-  homo    <- getn("homo_gap", -1)
+  # homo_gap unset -> NULL -> R's HOMOPOLYMER_GAP_PENALTY falls back to GAP_PENALTY.
+  homo    <- getn("homo_gap", NULL)
   pfwd    <- getv("primer_fwd"); prev <- getv("primer_rev")
   mm      <- getn("max_mismatch", 2)
   if (is.null(pfwd) || is.null(prev)) stop("pacbio needs primer_fwd= and primer_rev=")

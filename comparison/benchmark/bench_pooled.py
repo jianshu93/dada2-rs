@@ -22,7 +22,8 @@ Two platforms:
   illumina : paired-end. filter -> learn(F,R) -> dada-pooled(F,R) ->
              merge-pairs -> make-sequence-table -> remove-bimera-denovo
   pacbio   : single-end long reads. remove-primers(+orient+filter) ->
-             learn(pacbio errfun, k=7) -> dada-pooled(band 32, homo-gap -1, k=7)
+             learn(pacbio errfun, k=7) -> dada-pooled(band 32, k=7; homo-gap
+             falls back to --gap-p unless --homo-gap is set)
              -> make-sequence-table -> remove-bimera-denovo. (R does primer
              removal and filtering as two steps: removePrimers -> filterAndTrim.)
              Input is RAW, primered reads; pass --primer-fwd/--primer-rev.
@@ -285,8 +286,12 @@ def rust_illumina(args, bin_, outdir, results):
 
 
 def pacbio_dada_extra(args):
-    return ["--band", str(args.band), "--homo-gap-p", str(args.homo_gap),
-            "--kmer-size", str(args.kmer_size)]
+    extra = ["--band", str(args.band), "--kmer-size", str(args.kmer_size)]
+    # Only pass --homo-gap-p when explicitly set; otherwise dada2-rs falls back to
+    # --gap-p (R's HOMOPOLYMER_GAP_PENALTY=NULL -> GAP_PENALTY semantics).
+    if args.homo_gap is not None:
+        extra += ["--homo-gap-p", str(args.homo_gap)]
+    return extra
 
 
 def prepare_pacbio(args, bin_, outdir, results):
@@ -319,15 +324,17 @@ def prepare_pacbio(args, bin_, outdir, results):
 
     err = outdir / "errors_pacbio.json"
     # Learn with the SAME alignment params used for denoising (band, homo-gap-p,
-    # kmer) so the error model matches the dada step — otherwise the model is
-    # learned at the default homo-gap-p (-8) while dada uses -1, which dada2-rs
-    # warns about and which subtly changes the PacBio result.
-    run_step("learn", [bin_, "learn-errors", *map(str, filts),
-             "--nbases", str(int(args.nbases)), "--errfun", "pacbio",
-             "--band", str(args.band), "--homo-gap-p", str(args.homo_gap),
-             "--kmer-size", str(args.kmer_size),
-             "--threads", str(args.threads), "-o", err],
-             outdir / "learn.log", results)
+    # kmer) so the error model matches the dada step — if --homo-gap is set but
+    # only passed to dada, the model would be learned at a different homo-gap-p
+    # and dada2-rs would warn. When --homo-gap is unset, both learn and dada
+    # fall back to --gap-p, staying consistent.
+    learn_cmd = [bin_, "learn-errors", *map(str, filts),
+                 "--nbases", str(int(args.nbases)), "--errfun", "pacbio",
+                 "--band", str(args.band), "--kmer-size", str(args.kmer_size),
+                 "--threads", str(args.threads), "-o", err]
+    if args.homo_gap is not None:
+        learn_cmd += ["--homo-gap-p", str(args.homo_gap)]
+    run_step("learn", learn_cmd, outdir / "learn.log", results)
     return {"filts": filts, "names": names, "err": err}
 
 
@@ -481,9 +488,13 @@ def r_common_args(args, statedir):
               f"trunc_len={args.trunc_len}"]
     else:
         a += [f"min_len={args.min_len}", f"max_len={args.max_len}",
-              f"band={args.band}", f"homo_gap={args.homo_gap}",
+              f"band={args.band}",
               f"primer_fwd={args.primer_fwd}", f"primer_rev={args.primer_rev}",
               f"max_mismatch={args.max_mismatch}"]
+        # omit homo_gap when unset -> R's getn(...,NULL) -> HOMOPOLYMER_GAP_PENALTY
+        # falls back to GAP_PENALTY.
+        if args.homo_gap is not None:
+            a.append(f"homo_gap={args.homo_gap}")
     return a
 
 
@@ -528,9 +539,11 @@ def run_r_single(args, outdir):
               f"trunc_len={args.trunc_len}"]
     else:
         a += [f"min_len={args.min_len}", f"max_len={args.max_len}",
-              f"band={args.band}", f"homo_gap={args.homo_gap}",
+              f"band={args.band}",
               f"primer_fwd={args.primer_fwd}", f"primer_rev={args.primer_rev}",
               f"max_mismatch={args.max_mismatch}"]
+        if args.homo_gap is not None:
+            a.append(f"homo_gap={args.homo_gap}")
     log = outdir / "r_single.log"
     if log.exists():
         log.unlink()
@@ -661,7 +674,12 @@ def main():
     p.add_argument("--min-len", type=float, default=1000)
     p.add_argument("--max-len", type=float, default=1600)
     p.add_argument("--band", type=int, default=32)
-    p.add_argument("--homo-gap", type=int, default=-1)
+    p.add_argument("--homo-gap", type=int, default=None,
+                   help="PacBio HOMOPOLYMER_GAP_PENALTY. Default: unset, so both "
+                        "stacks fall back to the gap penalty (dada2-rs --gap-p; R "
+                        "NULL -> GAP_PENALTY = -8). Pass e.g. -1 only to opt into the "
+                        "legacy 454/CCS homopolymer-tolerant value (HiFi reads don't "
+                        "need it).")
     p.add_argument("--kmer-size", type=int, default=7)
     # PacBio primer removal (mirrors removePrimers); defaults are 27F / 1492R
     p.add_argument("--primer-fwd", default="AGRGTTYGATYMTGGCTCAG",

@@ -143,7 +143,8 @@ if (platform == "illumina") {
 ## PACBIO
 ## =========================================================================
 } else if (platform == "pacbio") {
-  band <- getn("band", 32); homo <- getn("homo_gap", -1)
+  # homo_gap unset -> NULL -> R's HOMOPOLYMER_GAP_PENALTY falls back to GAP_PENALTY.
+  band <- getn("band", 32); homo <- getn("homo_gap", NULL)
   if (step == "remove_primers") {
     input   <- getv("input"); if (is.null(input)) stop("remove_primers needs input=")
     pfwd <- getv("primer_fwd"); prev <- getv("primer_rev")
