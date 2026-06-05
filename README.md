@@ -1,50 +1,42 @@
 # dada2-rs
 
+📖 **Documentation:** [dada2-rs.readthedocs.io](https://dada2-rs.readthedocs.io) — installation, Illumina/PacBio walkthroughs, and the performance/benchmarking reference.
+
 An experimental implementation of DADA2 in Rust, using Claude Code (specically Sonnet 4.6 and Opus 4.6/4.7/4.8) for the bulk of the work. 
 
 ## Implementations
 
-- Rust ports of: 
-  - [x] Filter/trimming FASTQ (`filterAndTrim`)
-  - [x] Dereplication (`derepFastq`)
-  - [x] Error model (`learnErrors`)
-  - [x] Denoising (`dada`)
-  - [x] Merging (`mergePairs`)
-  - [x] Current error models (`loessErrfun`, `PacBioErrfun`, `noqualErrfun`, `makeBinnedErrfun`) - *only `loessErrfun`, `PacBioErrfun`, and `noqualErrfun` have been tested*
-  - [x] Chimera removal (`removeBimeraDenovo`)
-  - [x] RDP taxonomic classifier (`assignTaxonomy`) + (`assignSpecies`)
-  - [x] Other intermediate functions (`mergeTables`)
+Rust ports of:
+
+  | Step | DADA2 (R) | dada2-rs |
+  |---|---|---|
+  | Filter/trimming FASTQ | `filterAndTrim` | `filter-and-trim` |
+  | Filter/trimming FASTQ (PacBio) | `removePrimers`,`filterAndTrim` | `remove-primers` (one step) |
+  | Dereplication | `derepFastq` | `derep` |
+  | Error models | `learnErrors` | `learn-errors` |
+  | Denoising | `dada` | `dada` |
+  | Merging | `mergePairs` | `merge-pairs` |
+  | Chimera removal | `removeBimeraDenovo` | `remove-bimera-denovo` |
+  | RDP taxonomic classifier | `assignTaxonomy` + `assignSpecies` | `assign-taxonomy` + `assign-species` |
+  | Merging sequence tables | `mergeSequenceTables` | `make-sequence-table` (accepts multiple inputs) |
+  | Making sequence tables from multiple inputs | `makeSequenceTable` | `make-sequence-table` |
+
+- Current error models:
+  - `loessErrfun`
+  - `PacBioErrfun`
+  - `noqualErrfun`
+  - `makeBinnedErrfun`
+  - Custom error models in R and/or Python - *Experimental, tested*
 - Other functionality:
-  - [x] Intermediate outputs (in JSON) - can be evaluated for debugging purposes or for plotting in R, Python, etc.
-  - [x] Add basic regression tests for each stage that follow those within the original DADA2 repository
-  - [x] Custom error models in R and/or Python - *experimental, basic tests in place*
-  - [x] Docker builds available
-
-## Latest Benchmarks
-
-The implementation is roughly 4.5x faster than the R DADA2 implementation (not including R loading overhead), and uses about 1/8 the memory. See also the Project Background for how this started and how we intend to move forward on this implementation.
-
-### Illumina MiSeq (MiSeq SOP data)
-
-Per Issue #4. Tested on MacBook Pro (M1)
-
-| Threads | Rust real | Rust user | Rust RSS | R real | R user | R RSS | Speedup (real) | RSS ratio |
-|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | **173.71s** | 168.69s | **262 MB** | 785.02s | 765.68s | 1222 MB | **4.5×** | 4.7× less |
-| 4 | **47.66s** | 183.10s | **283 MB** | 220.07s | 783.07s | 1413 MB | **4.6×** | 5.0× less |
-| 8 | **33.52s** | 208.45s | **276 MB** | 153.43s | 922.67s | 1404 MB | **4.6×** | 5.1× less |
-
-### Illumina MiSeq (i100 binned quality scores)
-
-TODO, need example set
-
-### PacBio HiFi (standard, full quality scores)
-
-TODO, need example set
-
-### PacBio HiFi (Kinnex, binned quality scores)
-
-TODO, need example set
+  - Helper functions to convert sequence tables to TSV or FASTA (`seq-table-to-fasta`, `seq-table-to-tsv`)
+  - Helper function to convert taxonomic output to TSV (`tax-to-tsv`)
+  - Basic scripts and examples for comparing results between runs to trace
+    differences
+  - Experimental sub-sampling function for input FASTQ (`sample`) and related error model function (`errors-from-sample`) that mirrors `learn-errors` (can be used for bootstrapping)
+  - Intermediate outputs (in JSON) - can be evaluated for debugging purposes or for plotting in R, Python, etc.
+  - Dedicated Docker builds available
+- In progress
+  - Summary FASTQ metrics and plots
 
 ## Building
 
@@ -54,6 +46,9 @@ Requires a recent stable Rust toolchain ([rustup.rs](https://rustup.rs)).
 cargo build --release
 # binary at target/release/dada2-rs
 ```
+
+For the native (`-C target-cpu=native`) build and Docker, see
+**[Installation](docs/installation.md)**.
 
 ## Subcommands
 
@@ -72,109 +67,25 @@ cargo build --release
 
 Run `dada2-rs <subcommand> --help` for full parameter documentation.
 
-## Typical MiSeq workflow
+## Usage & walkthroughs
 
-The steps below follow the [DADA2 MiSeq SOP](http://benjjneb.github.io/dada2/tutorial.html).
-All intermediate outputs are JSON and can be inspected or plotted independently.
+End-to-end examples live in the documentation:
 
-### 1. Filter and trim
+- **[Illumina MiSeq walkthrough](docs/walkthrough-illumina.md)** (paired-end)
+- **[PacBio HiFi walkthrough](docs/walkthrough-pacbio.md)** (single-end, primer removal + PacBio-tuned params)
 
-```bash
-dada2-rs filter-and-trim \
-  --fwd  raw/sample_R1.fastq.gz --filt filtered/sample_R1.fastq.gz \
-  --rev  raw/sample_R2.fastq.gz --filt-rev filtered/sample_R2.fastq.gz \
-  --trunc-len 240 160 \
-  --max-n 0 --max-ee 2 2 --trunc-q 2 \
-  --compress --verbose
-```
+Run `dada2-rs <subcommand> --help` for the full parameter set of any step.
 
-### 2. Learn the error model
+## Benchmarks & comparison with R DADA2
 
-**Option A — from pre-computed derep JSON files** (via `sample` subcommand):
+Performance is benchmarked head-to-head against R DADA2 with the harness in
+`comparison/benchmark/`. See the docs for the tooling, metrics, and results:
 
-```bash
-# Dereplicate and subsample forward reads across all samples
-dada2-rs sample filtered/*_R1.fastq.gz \
-  --output-dir sample_json/ --nbases 100000000 --verbose
+- **[Performance — tooling & metrics](docs/benchmarking.md)** (the harness,
+  `cores`/`cpu_s`/peak-RSS, scaling sweeps, built-in logs, concordance checks)
+- **[Benchmark results](docs/results.md)** (head-to-head scorecards by platform
+  and pooling mode)
 
-# Learn error model
-dada2-rs errors-from-sample sample_json/*.json \
-  --errfun loess -o errors_fwd.json --verbose
-```
-
-**Option B — directly from FASTQ** (single command):
-
-```bash
-dada2-rs learn-errors filtered/*_R1.fastq.gz \
-  --nbases 100000000 --errfun loess \
-  -o errors_fwd.json --verbose
-```
-
-#### Visualise cluster diagnostics during error learning
-
-Pass `--diag-dir` to emit a `iter_NNN.json` file for each self-consistency
-iteration, then plot with the bundled R script:
-
-```bash
-dada2-rs errors-from-sample sample_json/*.json \
-  --errfun loess --diag-dir diag_fwd/ -o errors_fwd.json --verbose
-
-Rscript comparison/plot_cluster_diag.R diag_fwd/ diag_fwd/cluster_diag.pdf
-```
-
-The plot shows cluster counts, birth-type breakdown, convergence trace, and
-alignment work across iterations.
-
-### 3. Denoise each sample
-
-```bash
-dada2-rs dada filtered/sample_R1.fastq.gz \
-  --error-model errors_fwd.json --show-map \
-  -o dada/sample_R1.json --verbose
-```
-
-Repeat for reverse reads using the reverse error model.
-
-### 4. Merge paired reads
-
-```bash
-dada2-rs merge-pairs \
-  --fwd-dada dada/fwd/*.json \
-  --rev-dada dada/rev/*.json \
-  --fwd-fastq filtered/fwd/*.fastq.gz \
-  --rev-fastq filtered/rev/*.fastq.gz \
-  -o merged.json --verbose
-```
-
-### 5. Build sequence table and remove chimeras
-
-```bash
-dada2-rs make-sequence-table merged.json -o seqtab.json
-dada2-rs remove-bimera-denovo seqtab.json --method consensus -o seqtab_nochim.json
-```
-
-### Visualise the error model
-
-```bash
-Rscript plot_errors.R errors_fwd.json errors_fwd.pdf
-```
-
-## Comparing with R DADA2
-
-The `comparison/` directory contains scripts for validating output against
-the reference R implementation on the MiSeq SOP dataset:
-
-```bash
-# Run Rust pipeline (filter → derep → error model)
-bash comparison/run_rust_errors.sh
-
-# Compare error matrices against R's learnErrors()
-Rscript comparison/compare_errors.R \
-  comparison/comparison_out/F3D0_S188_L001_R1_001_filtered.fastq.gz \
-  comparison/comparison_out/F3D0_S188_L001_R1_001_errors_rust.json
-```
-
-Requires R packages: `dada2`, `jsonlite`, `ggplot2`, `gridExtra`.
 
 ## AI Assistance Disclosure
 
