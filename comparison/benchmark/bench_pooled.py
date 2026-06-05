@@ -294,9 +294,14 @@ def prepare_pacbio(args, bin_, outdir, results):
     run_phase_concurrent("remove_primers", jobs, results, args.threads)
 
     err = outdir / "errors_pacbio.json"
+    # Learn with the SAME alignment params used for denoising (band, homo-gap-p,
+    # kmer) so the error model matches the dada step — otherwise the model is
+    # learned at the default homo-gap-p (-8) while dada uses -1, which dada2-rs
+    # warns about and which subtly changes the PacBio result.
     run_step("learn", [bin_, "learn-errors", *map(str, filts),
              "--nbases", str(int(args.nbases)), "--errfun", "pacbio",
-             "--band", str(args.band), "--kmer-size", str(args.kmer_size),
+             "--band", str(args.band), "--homo-gap-p", str(args.homo_gap),
+             "--kmer-size", str(args.kmer_size),
              "--threads", str(args.threads), "-o", err],
              outdir / "learn.log", results)
     return {"filts": filts, "names": names, "err": err}

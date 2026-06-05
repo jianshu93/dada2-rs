@@ -180,7 +180,8 @@ if (platform == "illumina") {
     m <- readRDS(sp("manifest.rds"))
     err <- timed("learn", learnErrors(m$filts, nbases = nbases,
                                       errorEstimationFunction = PacBioErrfun,
-                                      BAND_SIZE = band, multithread = multithread))
+                                      BAND_SIZE = band, HOMOPOLYMER_GAP_PENALTY = homo,
+                                      multithread = multithread))
     saveRDS(err, sp("err.rds"))
 
   } else if (step == "dada") {

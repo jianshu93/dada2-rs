@@ -149,7 +149,8 @@ if (platform == "illumina") {
 
   err <- timed("learn", learnErrors(filts, nbases = nbases,
                                     errorEstimationFunction = PacBioErrfun,
-                                    BAND_SIZE = band, multithread = multithread))
+                                    BAND_SIZE = band, HOMOPOLYMER_GAP_PENALTY = homo,
+                                    multithread = multithread))
 
   dd <- timed("dada", dada(filts, err = err, pool = pool_flag, BAND_SIZE = band,
                            HOMOPOLYMER_GAP_PENALTY = homo,
