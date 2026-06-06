@@ -2400,9 +2400,17 @@ fn main() -> io::Result<()> {
             trace_min_abund,
             verbose,
         } => {
-            // R's HOMOPOLYMER_GAP_PENALTY = NULL tracks GAP_PENALTY.
+            // R's HOMOPOLYMER_GAP_PENALTY = NULL tracks GAP_PENALTY. R also
+            // normalizes a positive penalty to negative before comparing them
+            // (dada.R:223-227), so `--homo-gap-p 1` means the same as `-1`.
             let gap_p = gap_p.unwrap_or(-8);
+            let gap_p = if gap_p > 0 { -gap_p } else { gap_p };
             let homo_gap_p = homo_gap_p.unwrap_or(gap_p);
+            let homo_gap_p = if homo_gap_p > 0 {
+                -homo_gap_p
+            } else {
+                homo_gap_p
+            };
             let greedy = greedy.unwrap_or(true);
             let use_quals = use_quals.unwrap_or(true);
             let loess_config = resolve_loess_config(
@@ -3065,9 +3073,17 @@ fn main() -> io::Result<()> {
             trace_min_abund,
             verbose,
         } => {
-            // R's HOMOPOLYMER_GAP_PENALTY = NULL tracks GAP_PENALTY.
+            // R's HOMOPOLYMER_GAP_PENALTY = NULL tracks GAP_PENALTY. R also
+            // normalizes a positive penalty to negative before comparing them
+            // (dada.R:223-227), so `--homo-gap-p 1` means the same as `-1`.
             let gap_p = gap_p.unwrap_or(-8);
+            let gap_p = if gap_p > 0 { -gap_p } else { gap_p };
             let homo_gap_p = homo_gap_p.unwrap_or(gap_p);
+            let homo_gap_p = if homo_gap_p > 0 {
+                -homo_gap_p
+            } else {
+                homo_gap_p
+            };
             let greedy = greedy.unwrap_or(true);
             let use_quals = use_quals.unwrap_or(true);
             let loess_config = resolve_loess_config(
@@ -3459,11 +3475,20 @@ fn resolve_dada_params(
     let detect_singletons = resolve!(detect_singletons, detect_singletons, false);
     let band = resolve!(band, band, 16);
     let gap_p = resolve!(gap_p, gap_p, -8);
+    // R normalizes a positive gap penalty to negative (dada.R:223) before the
+    // homopolymer comparison; do the same so `--gap-p 8` == `-8`.
+    let gap_p = if gap_p > 0 { -gap_p } else { gap_p };
     let match_score = resolve!(match_score, match_score, 5);
     let mismatch = resolve!(mismatch, mismatch, -4);
     // R's HOMOPOLYMER_GAP_PENALTY = NULL tracks GAP_PENALTY: default tier is
-    // the resolved gap_p, not a literal -8.
+    // the resolved gap_p, not a literal -8. A positive value is normalized to
+    // negative as well (dada.R:227), matching the gap_p handling above.
     let homo_gap_p = resolve!(homo_gap_p, homo_gap_p, gap_p);
+    let homo_gap_p = if homo_gap_p > 0 {
+        -homo_gap_p
+    } else {
+        homo_gap_p
+    };
     let max_clust = resolve!(max_clust, max_clust, 0);
     let greedy = resolve!(greedy, greedy, true);
     let use_quals = resolve!(use_quals, use_quals, true);

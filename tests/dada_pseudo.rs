@@ -542,6 +542,19 @@ fn dada_homo_gap_defaults_to_gap_penalty() {
     run_dada(&gh, &["--gap-p", "-4", "--homo-gap-p", "-1"]);
     assert_eq!(param_i64(&gh, "gap_p"), -4);
     assert_eq!(param_i64(&gh, "homo_gap_p"), -1);
+
+    // Positive penalties are normalized to negative (R dada.R:223-227): a
+    // positive --gap-p flips sign and homo falls back to the normalized value;
+    // a positive --homo-gap-p flips independently.
+    let pos = dir.join("pos.json");
+    run_dada(&pos, &["--gap-p", "8"]);
+    assert_eq!(param_i64(&pos, "gap_p"), -8);
+    assert_eq!(param_i64(&pos, "homo_gap_p"), -8);
+
+    let posh = dir.join("posh.json");
+    run_dada(&posh, &["--gap-p", "-4", "--homo-gap-p", "1"]);
+    assert_eq!(param_i64(&posh, "gap_p"), -4);
+    assert_eq!(param_i64(&posh, "homo_gap_p"), -1);
 }
 
 #[test]
