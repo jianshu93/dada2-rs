@@ -75,7 +75,7 @@ batch, `cpu_s` = sum across children, `peak_rss` = max of any single child.
 | `--threads N` | total threads |
 | `--pool {true,false,pseudo}` | denoising mode (see §1.1) |
 | `--sample-jobs N` | samples denoised concurrently for `pseudo`/`false` (default `round(threads/4)`) |
-| `--low-memory` | `pseudo` only: stream samples instead of caching (bounds peak RSS) |
+| `--cache-samples` | `pseudo` only: hold all samples in memory (default is streaming, which benchmarked faster + lighter) |
 | `--run-r` | also run the R pipeline (off by default → dada2-rs only) |
 | `--r-mode {split,single,both}` | how to run R (see §1.5) |
 | `--no-run-rust` | skip the dada2-rs pipeline |
@@ -139,9 +139,9 @@ python3 comparison/benchmark/bench_pooled.py pacbio /data/HiFi \
     --dada2rs target/release-native/dada2-rs --threads 24 --pool pseudo \
     --primer-fwd AGRGTTYGATYMTGGCTCAG --primer-rev RGYTACCTTGTTACGACTT --run-r
 
-# pseudo in streaming (low-memory) mode
+# pseudo in cached mode (default is streaming; --cache-samples opts into all-in-memory)
 python3 comparison/benchmark/bench_pooled.py illumina /data/MiSeqSOP \
-    --dada2rs target/release-native/dada2-rs --threads 24 --pool pseudo --low-memory
+    --dada2rs target/release-native/dada2-rs --threads 24 --pool pseudo --cache-samples
 ```
 
 ### 1.7 Distilling results to Markdown
@@ -336,5 +336,5 @@ For a head-to-head where R's C was compiled with the cluster's native gcc, prefe
 4. **Quantify scaling:** `--thread-sweep` (thread scaling) and
    `--sample-jobs-sweep` (samples-in-flight, with `peak_rss`).
 5. **Validate results:** `compare_asvs.py` / `compare_errors.R` before reporting.
-6. **Memory-constrained / huge sample sets:** add `--low-memory` (pseudo) and
-   compare peak RSS vs wall.
+6. **Memory-constrained / huge sample sets:** `pseudo` streams by default; use
+   `--cache-samples` to compare the all-in-memory mode (peak RSS vs wall).

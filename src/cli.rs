@@ -507,14 +507,16 @@ pub enum Commands {
         #[arg(long)]
         sample_jobs: Option<usize>,
 
-        /// Stream samples instead of caching all uniques in memory. Each of the
-        /// two rounds re-reads (and re-dereplicates) its inputs, so peak memory
-        /// is bounded by `--sample-jobs` samples in flight rather than all
-        /// samples at once — useful for many or large/complex samples. Output is
-        /// identical; the cost is the extra round-2 dereplication. Default off
-        /// (cache; faster).
+        /// Cache every sample's uniques in memory across both pseudo-pooling
+        /// rounds. By default dada-pseudo STREAMS: each sample is dropped after
+        /// round 1 and re-read (re-dereplicated) in round 2, bounding peak
+        /// memory to `--sample-jobs` samples in flight rather than all samples
+        /// at once. Streaming is both faster and lighter on large runs (the
+        /// retained all-samples cache is pure overhead — re-dereplication is
+        /// cheaper than carrying it), so it is the default; pass --cache-samples
+        /// to force the old all-in-memory behavior. Output is identical.
         #[arg(long)]
-        low_memory: bool,
+        cache_samples: bool,
 
         /// Significance threshold for abundance-based cluster splitting (omega_a)
         #[arg(long)]

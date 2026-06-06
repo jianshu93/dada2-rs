@@ -1210,7 +1210,7 @@ fn main() -> io::Result<()> {
             phred_offset,
             threads,
             sample_jobs,
-            low_memory,
+            cache_samples,
             omega_a,
             omega_c,
             omega_p,
@@ -1234,6 +1234,11 @@ fn main() -> io::Result<()> {
         } => {
             use std::collections::{HashMap, HashSet};
             use std::sync::Mutex;
+
+            // Streaming is the default (faster AND lighter on large runs — the
+            // retained all-samples cache is pure overhead); --cache-samples opts
+            // back into holding every sample's uniques across both rounds.
+            let low_memory = !cache_samples;
 
             let n_samples = input.len();
             // How many samples to denoise concurrently (each on a threads/jobs

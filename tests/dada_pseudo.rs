@@ -318,17 +318,17 @@ fn dada_pseudo_is_deterministic_across_sample_jobs() {
     }
 }
 
-/// `--low-memory` streams samples (re-reading inputs per round) instead of
-/// caching all uniques; it must produce byte-identical output to the cached
-/// default — streaming changes only *when* uniques are materialized.
+/// dada-pseudo streams by default (re-reading inputs per round); `--cache-samples`
+/// holds all uniques in memory instead. The two must produce byte-identical
+/// output — caching changes only *when* uniques are materialized, not the result.
 #[test]
-fn dada_pseudo_low_memory_matches_cached() {
+fn dada_pseudo_streaming_matches_cached() {
     let dir = scratch("pseudo_lowmem");
     let err = shared_err_model();
     let s1 = fixture("sam1F.fastq.gz");
     let s2 = fixture("sam2F.fastq.gz");
 
-    let run_mode = |out: &Path, low_memory: bool| {
+    let run_mode = |out: &Path, cache_samples: bool| {
         let mut args = vec![
             "dada-pseudo",
             s1.to_str().unwrap(),
@@ -342,19 +342,20 @@ fn dada_pseudo_low_memory_matches_cached() {
             "--threads",
             "4",
         ];
-        if low_memory {
-            args.push("--low-memory");
+        if cache_samples {
+            args.push("--cache-samples");
         }
         run(&args);
     };
+    // Default = streaming; --cache-samples = the all-in-memory mode.
     let (cache, stream) = (dir.join("cache"), dir.join("stream"));
-    run_mode(&cache, false);
-    run_mode(&stream, true);
+    run_mode(&cache, true);
+    run_mode(&stream, false);
     for sample in ["sam1F.json", "sam2F.json"] {
         assert_eq!(
             std::fs::read(cache.join(sample)).unwrap(),
             std::fs::read(stream.join(sample)).unwrap(),
-            "dada-pseudo --low-memory output for {sample} differs from the cached run",
+            "dada-pseudo streaming (default) output for {sample} differs from --cache-samples",
         );
     }
 }
