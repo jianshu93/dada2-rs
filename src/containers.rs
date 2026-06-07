@@ -109,8 +109,32 @@ impl Raw {
     /// `seq` must already use the integer encoding (A=1, C=2, G=3, T=4).
     /// `qual` values are rounded to `u8`, matching the C++ implementation.
     pub fn new(seq: Vec<u8>, qual: Option<&[f64]>, reads: u32, prior: bool) -> Self {
+        let qual = qual.map(|q| q.iter().map(|&v| v.round() as u8).collect());
+        Self::with_qual(seq, qual, reads, prior)
+    }
+
+    /// Construct a Raw from integer per-position Phred *sums* (deferred division,
+    /// issue #23), recovering each stored u8 quality as `round(sum / reads)`.
+    ///
+    /// This builds the `u8` qual vector Raw owns directly from the sums — no
+    /// intermediate `Vec<f64>` mean. That intermediate, churned per-raw across
+    /// threads with variable sequence lengths, fragmented the glibc arena and
+    /// inflated peak RSS in the long-lived cached path; the scalar conversion
+    /// here avoids it entirely.
+    pub fn from_qual_sums(
+        seq: Vec<u8>,
+        qual_sums: Option<&[u32]>,
+        reads: u32,
+        prior: bool,
+    ) -> Self {
+        let c = reads as f64;
+        let qual = qual_sums.map(|s| s.iter().map(|&x| (x as f64 / c).round() as u8).collect());
+        Self::with_qual(seq, qual, reads, prior)
+    }
+
+    fn with_qual(seq: Vec<u8>, qual: Option<Vec<u8>>, reads: u32, prior: bool) -> Self {
         Raw {
-            qual: qual.map(|q| q.iter().map(|&v| v.round() as u8).collect()),
+            qual,
             seq,
             prior,
             kmer: None,

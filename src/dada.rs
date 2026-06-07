@@ -118,17 +118,6 @@ pub struct RawInput {
     pub quals: Option<Vec<u32>>,
 }
 
-impl RawInput {
-    /// Recover the per-position mean Phred quality (`sum / abundance`) consumed
-    /// by the rest of the pipeline. `None` when no quals are stored.
-    pub fn mean_quals(&self) -> Option<Vec<f64>> {
-        self.quals.as_ref().map(|sums| {
-            let c = self.abundance as f64;
-            sums.iter().map(|&s| s as f64 / c).collect()
-        })
-    }
-}
-
 /// Per-cluster summary produced by `dada_uniques`.
 pub struct ClusterSummary {
     /// Integer-encoded representative (center) sequence.
@@ -301,8 +290,12 @@ pub fn dada_uniques_cached(
                 .enumerate()
                 .map(|(i, inp)| {
                     let seq: Vec<u8> = inp.seq.bytes().map(nt_encode).collect();
-                    let qual = if has_quals { inp.mean_quals() } else { None };
-                    let mut raw = Raw::new(seq, qual.as_deref(), inp.abundance, inp.prior);
+                    let qual = if has_quals {
+                        inp.quals.as_deref()
+                    } else {
+                        None
+                    };
+                    let mut raw = Raw::from_qual_sums(seq, qual, inp.abundance, inp.prior);
                     raw.index = i as u32;
                     raw
                 })
