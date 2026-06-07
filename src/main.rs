@@ -489,7 +489,7 @@ fn main() -> io::Result<()> {
                                 seq: sequence,
                                 abundance: count as u32,
                                 prior: false,
-                                quals: Some(quals),
+                                quals: Some(dada::RawInput::sums_from_means(&quals, count as u32)),
                             }
                         })
                         .collect();
@@ -553,7 +553,7 @@ fn main() -> io::Result<()> {
                         seq: sequence,
                         abundance: count as u32,
                         prior: false,
-                        quals: Some(quals),
+                        quals: Some(dada::RawInput::sums_from_means(&quals, count as u32)),
                     }
                 })
                 .collect();
@@ -985,10 +985,10 @@ fn main() -> io::Result<()> {
                     let sequence: String = String::from_utf8(merged_seqs[i].clone())
                         .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
                     dada::RawInput {
+                        quals: Some(dada::RawInput::sums_from_means(&mean_qual, merged_total[i])),
                         seq: sequence,
                         abundance: merged_total[i],
                         prior: false,
-                        quals: Some(mean_qual),
                     }
                 })
                 .collect();
@@ -3710,7 +3710,7 @@ fn load_sample_raws(
                 seq: sequence,
                 abundance: count as u32,
                 prior: false,
-                quals: Some(quals),
+                quals: Some(dada::RawInput::sums_from_means(&quals, count as u32)),
             }
         })
         .collect();

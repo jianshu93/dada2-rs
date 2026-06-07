@@ -314,7 +314,7 @@ pub fn load_fastq_samples(
                 seq: String::from_utf8(seq).unwrap_or_default(),
                 abundance: count as u32,
                 prior: false,
-                quals: Some(derep.quals[i].clone()),
+                quals: Some(RawInput::sums_from_means(&derep.quals[i], count as u32)),
             })
             .collect();
 
@@ -386,10 +386,10 @@ pub fn load_derep_samples(paths: &[PathBuf]) -> io::Result<Vec<Vec<RawInput>>> {
                 .uniques
                 .into_iter()
                 .map(|u| RawInput {
+                    quals: Some(RawInput::sums_from_means(&u.mean_quality, u.count as u32)),
                     seq: u.sequence,
                     abundance: u.count as u32,
                     prior: false,
-                    quals: Some(u.mean_quality),
                 })
                 .collect();
             // Defensive sort: derep JSONs produced by older versions (or by
@@ -411,8 +411,8 @@ fn detect_nq(all_inputs: &[Vec<RawInput>]) -> usize {
     let max_q = all_inputs
         .iter()
         .flat_map(|s| s.iter())
-        .filter_map(|r| r.quals.as_deref())
-        .flat_map(|qs| qs.iter().copied())
+        .filter_map(|r| r.mean_quals())
+        .flat_map(|qs| qs.into_iter())
         .map(|q| q.round() as usize)
         .max()
         .unwrap_or(40);
@@ -543,13 +543,13 @@ fn build_trans_mat(
                     Some(ci) => ci,
                     None => return (trans, buf),
                 };
-                let quals = match &inp.quals {
-                    Some(q) => q.as_slice(),
+                let quals = match inp.mean_quals() {
+                    Some(q) => q,
                     None => return (trans, buf),
                 };
 
                 let seq: Vec<u8> = inp.seq.bytes().map(nt_encode).collect();
-                let raw_query = Raw::new(seq, Some(quals), inp.abundance, false);
+                let raw_query = Raw::new(seq, Some(&quals), inp.abundance, false);
                 let raw_center = &center_raws[ci];
 
                 // Align center (ref = al0) against the raw (query = al1).
