@@ -314,7 +314,7 @@ pub fn load_fastq_samples(
                 seq: String::from_utf8(seq).unwrap_or_default(),
                 abundance: count as u32,
                 prior: false,
-                quals: Some(RawInput::sums_from_means(&derep.quals[i], count as u32)),
+                quals: Some(derep.quals[i].clone()),
             })
             .collect();
 
@@ -354,7 +354,8 @@ pub fn load_fastq_samples(
 struct UniqueEntryJson {
     sequence: String,
     count: u64,
-    mean_quality: Vec<f64>,
+    /// Per-position integer Phred SUM; mean recovered as sum/count on demand.
+    qual_sum: Vec<u32>,
 }
 
 /// Top-level structure of a derep/sample JSON file.
@@ -386,7 +387,7 @@ pub fn load_derep_samples(paths: &[PathBuf]) -> io::Result<Vec<Vec<RawInput>>> {
                 .uniques
                 .into_iter()
                 .map(|u| RawInput {
-                    quals: Some(RawInput::sums_from_means(&u.mean_quality, u.count as u32)),
+                    quals: Some(u.qual_sum),
                     seq: u.sequence,
                     abundance: u.count as u32,
                     prior: false,

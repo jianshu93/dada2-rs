@@ -119,29 +119,6 @@ pub struct RawInput {
 }
 
 impl RawInput {
-    /// Convert per-position mean Phred scores (the form every producer has on
-    /// hand) into the compact integer per-position sum stored in `quals`.
-    ///
-    /// `mean × abundance` recovers the exact integer sum the dereplicator
-    /// accumulated (the round-trip error of `s/c × c` is far below 0.5 for the
-    /// modest integer sums seen per unique), so this is lossless against the
-    /// prior f64-mean representation.
-    pub fn sums_from_means(means: &[f64], abundance: u32) -> Vec<u32> {
-        let c = abundance as f64;
-        means
-            .iter()
-            .map(|&m| {
-                let s = (m * c).round();
-                debug_assert!(
-                    (0.0..=u32::MAX as f64).contains(&s),
-                    "per-position Phred sum {s} overflows u32 (abundance {abundance}); \
-                     a single unique exceeds ~46M reads — widen to u64"
-                );
-                s as u32
-            })
-            .collect()
-    }
-
     /// Recover the per-position mean Phred quality (`sum / abundance`) consumed
     /// by the rest of the pipeline. `None` when no quals are stored.
     pub fn mean_quals(&self) -> Option<Vec<f64>> {

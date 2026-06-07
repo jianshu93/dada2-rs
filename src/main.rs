@@ -283,7 +283,8 @@ fn main() -> io::Result<()> {
             struct UniqueEntry<'a> {
                 sequence: &'a str,
                 count: u64,
-                mean_quality: &'a [f64],
+                /// Per-position integer Phred SUM; consumers divide by `count` on demand.
+                qual_sum: &'a [u32],
             }
 
             #[derive(Serialize)]
@@ -306,7 +307,7 @@ fn main() -> io::Result<()> {
                 uniq_entries.push(UniqueEntry {
                     sequence,
                     count: *count,
-                    mean_quality: &derep.quals[i],
+                    qual_sum: &derep.quals[i],
                 });
             }
 
@@ -489,7 +490,7 @@ fn main() -> io::Result<()> {
                                 seq: sequence,
                                 abundance: count as u32,
                                 prior: false,
-                                quals: Some(dada::RawInput::sums_from_means(&quals, count as u32)),
+                                quals: Some(quals),
                             }
                         })
                         .collect();
@@ -553,7 +554,7 @@ fn main() -> io::Result<()> {
                         seq: sequence,
                         abundance: count as u32,
                         prior: false,
-                        quals: Some(dada::RawInput::sums_from_means(&quals, count as u32)),
+                        quals: Some(quals),
                     }
                 })
                 .collect();
@@ -946,8 +947,10 @@ fn main() -> io::Result<()> {
                     let mu = match seq_to_merged.get(seq) {
                         Some(&i) => {
                             merged_total[i] += count_u32;
+                            // `qual` is already this unique's per-position Phred
+                            // sum; accumulate sums across samples.
                             for (p, &q) in qual.iter().enumerate() {
-                                merged_qual_sum[i][p] += q * count_u32 as f64;
+                                merged_qual_sum[i][p] += q as f64;
                             }
                             i
                         }
@@ -955,8 +958,7 @@ fn main() -> io::Result<()> {
                             let i = merged_seqs.len();
                             seq_to_merged.insert(seq.clone(), i);
                             merged_seqs.push(seq.clone());
-                            merged_qual_sum
-                                .push(qual.iter().map(|&q| q * count_u32 as f64).collect());
+                            merged_qual_sum.push(qual.iter().map(|&q| q as f64).collect());
                             merged_total.push(count_u32);
                             i
                         }
@@ -979,13 +981,15 @@ fn main() -> io::Result<()> {
             // ---- Build merged RawInput list ----
             let mut raw_inputs: Vec<dada::RawInput> = (0..n_merged)
                 .map(|i| {
-                    let total = merged_total[i] as f64;
-                    let mean_qual: Vec<f64> =
-                        merged_qual_sum[i].iter().map(|&s| s / total).collect();
                     let sequence: String = String::from_utf8(merged_seqs[i].clone())
                         .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
                     dada::RawInput {
-                        quals: Some(dada::RawInput::sums_from_means(&mean_qual, merged_total[i])),
+                        quals: Some(
+                            merged_qual_sum[i]
+                                .iter()
+                                .map(|&s| s.round() as u32)
+                                .collect(),
+                        ),
                         seq: sequence,
                         abundance: merged_total[i],
                         prior: false,
@@ -2233,7 +2237,8 @@ fn main() -> io::Result<()> {
             struct UniqueEntry<'a> {
                 sequence: &'a str,
                 count: u64,
-                mean_quality: &'a [f64],
+                /// Per-position integer Phred SUM; consumers divide by `count` on demand.
+                qual_sum: &'a [u32],
             }
             #[derive(Serialize)]
             struct DerepOutput<'a> {
@@ -2304,7 +2309,7 @@ fn main() -> io::Result<()> {
                     uniq_entries.push(UniqueEntry {
                         sequence,
                         count: *count,
-                        mean_quality: &derep.quals[i],
+                        qual_sum: &derep.quals[i],
                     });
                 }
                 let sample_out = DerepOutput {
@@ -3710,7 +3715,7 @@ fn load_sample_raws(
                 seq: sequence,
                 abundance: count as u32,
                 prior: false,
-                quals: Some(dada::RawInput::sums_from_means(&quals, count as u32)),
+                quals: Some(quals),
             }
         })
         .collect();
@@ -3884,7 +3889,8 @@ fn load_derep_for_dada(
         struct UniqueEntryJson {
             sequence: String,
             count: u64,
-            mean_quality: Vec<f64>,
+            /// Per-position integer Phred SUM; mean recovered as sum/count on demand.
+            qual_sum: Vec<u32>,
         }
         #[derive(serde::Deserialize)]
         struct SampleJson {
@@ -3903,21 +3909,21 @@ fn load_derep_for_dada(
             entries.sort_by_key(|a| std::cmp::Reverse(a.count));
         }
         let mut uniques: Vec<(Vec<u8>, u64)> = Vec::with_capacity(entries.len());
-        let mut quals: Vec<Vec<f64>> = Vec::with_capacity(entries.len());
+        let mut quals: Vec<Vec<u32>> = Vec::with_capacity(entries.len());
         for u in entries {
-            if !u.mean_quality.is_empty() && u.mean_quality.len() != u.sequence.len() {
+            if !u.qual_sum.is_empty() && u.qual_sum.len() != u.sequence.len() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
-                        "{}: mean_quality length {} != sequence length {}",
+                        "{}: qual_sum length {} != sequence length {}",
                         path.display(),
-                        u.mean_quality.len(),
+                        u.qual_sum.len(),
                         u.sequence.len(),
                     ),
                 ));
             }
             uniques.push((u.sequence.into_bytes(), u.count));
-            quals.push(u.mean_quality);
+            quals.push(u.qual_sum);
         }
         Ok((
             derep::Derep {
