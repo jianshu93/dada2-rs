@@ -656,6 +656,14 @@ pub enum Commands {
         #[arg(long)]
         just_concatenate: bool,
 
+        /// Rescue pairs that fail to merge by concatenating them, as in
+        /// --just-concatenate, instead of dropping them. Useful for
+        /// variable-length amplicons (e.g. ITS) whose reads may not overlap.
+        /// Rescued reads are marked `concatenated: true` and this takes
+        /// precedence over --return-rejects.
+        #[arg(long)]
+        rescue_unmerged: bool,
+
         /// Number of N characters in the concatenation spacer
         #[arg(long, default_value_t = 10)]
         concat_nnn_len: usize,

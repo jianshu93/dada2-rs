@@ -66,6 +66,11 @@ pub struct MergeParams {
     pub return_rejects: bool,
     /// When true, concatenate fwd + N-spacer + RC(rev) instead of merging.
     pub just_concatenate: bool,
+    /// When true, pairs that fail to merge (no overlap, or failing the overlap
+    /// criteria) are rescued by concatenating fwd + N-spacer + RC(rev) and
+    /// accepted, rather than being dropped. Useful for amplicons such as ITS
+    /// whose reads may not overlap. Takes precedence over `return_rejects`.
+    pub rescue_unmerged: bool,
     /// Length of the N spacer used when `just_concatenate` is true.
     pub concat_nnn_len: usize,
     /// When true, trim portions of fwd/rev that overhang past the other read.
@@ -122,6 +127,10 @@ pub struct MergedPair {
     pub nindel: u32,
     /// Whether this merge met all acceptance criteria.
     pub accept: bool,
+    /// True when the sequence was produced by concatenation rather than an
+    /// overlap merge — i.e. via `--just-concatenate`, or via `--rescue-unmerged`
+    /// for a pair that failed the overlap criteria.
+    pub concatenated: bool,
 }
 
 /// Merging results for one sample.
@@ -487,6 +496,21 @@ pub fn merge_sample(
     let mut merged: Vec<MergedPair> = Vec::with_capacity(pair_counts.len());
     let mut accepted_pairs: u64 = 0;
     let mut align_buf = AlignBuffers::new();
+    let spacer = "N".repeat(params.concat_nnn_len);
+
+    // Build a concatenated (accepted) pair: fwd + N-spacer + RC(rev). Used by
+    // both `--just-concatenate` and `--rescue-unmerged`.
+    let make_concat = |fwd_seq: &str, rc_rev: &str, fi: usize, ri: usize, count: u64| MergedPair {
+        sequence: format!("{fwd_seq}{spacer}{rc_rev}"),
+        abundance: count,
+        forward: fi,
+        reverse: ri,
+        nmatch: 0,
+        nmismatch: 0,
+        nindel: 0,
+        accept: true,
+        concatenated: true,
+    };
 
     for ((fi, ri), count) in &pair_counts {
         let fwd_seq = &fwd_dada.asvs[*fi].sequence;
@@ -495,17 +519,7 @@ pub fn merge_sample(
 
         // Just-concatenate mode: no alignment required.
         if params.just_concatenate {
-            let spacer = "N".repeat(params.concat_nnn_len);
-            merged.push(MergedPair {
-                sequence: format!("{fwd_seq}{spacer}{rc_rev}"),
-                abundance: *count,
-                forward: *fi,
-                reverse: *ri,
-                nmatch: 0,
-                nmismatch: 0,
-                nindel: 0,
-                accept: true,
-            });
+            merged.push(make_concat(fwd_seq, &rc_rev, *fi, *ri, *count));
             accepted_pairs += count;
             continue;
         }
@@ -531,7 +545,10 @@ pub fn merge_sample(
             Some(v) => v,
             None => {
                 // No overlap at all.
-                if params.return_rejects {
+                if params.rescue_unmerged {
+                    merged.push(make_concat(fwd_seq, &rc_rev, *fi, *ri, *count));
+                    accepted_pairs += count;
+                } else if params.return_rejects {
                     merged.push(MergedPair {
                         sequence: String::new(),
                         abundance: *count,
@@ -541,6 +558,7 @@ pub fn merge_sample(
                         nmismatch: 0,
                         nindel: 0,
                         accept: false,
+                        concatenated: false,
                     });
                 }
                 continue;
@@ -550,6 +568,14 @@ pub fn merge_sample(
         let overlap_len = nmatch + nmismatch + nindel;
         let accept =
             overlap_len >= params.min_overlap && nmismatch <= params.max_mismatch && nindel == 0;
+
+        // Rescue pairs that overlapped but failed the acceptance criteria by
+        // concatenating them (takes precedence over return_rejects).
+        if !accept && params.rescue_unmerged {
+            merged.push(make_concat(fwd_seq, &rc_rev, *fi, *ri, *count));
+            accepted_pairs += count;
+            continue;
+        }
 
         if !accept && !params.return_rejects {
             continue;
@@ -578,6 +604,7 @@ pub fn merge_sample(
             nmismatch,
             nindel,
             accept,
+            concatenated: false,
         });
     }
 
