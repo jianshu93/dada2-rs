@@ -354,7 +354,8 @@ pub fn load_fastq_samples(
 struct UniqueEntryJson {
     sequence: String,
     count: u64,
-    mean_quality: Vec<f64>,
+    /// Per-position integer Phred SUM; mean recovered as sum/count on demand.
+    qual_sum: Vec<u32>,
 }
 
 /// Top-level structure of a derep/sample JSON file.
@@ -386,10 +387,10 @@ pub fn load_derep_samples(paths: &[PathBuf]) -> io::Result<Vec<Vec<RawInput>>> {
                 .uniques
                 .into_iter()
                 .map(|u| RawInput {
+                    quals: Some(u.qual_sum),
                     seq: u.sequence,
                     abundance: u.count as u32,
                     prior: false,
-                    quals: Some(u.mean_quality),
                 })
                 .collect();
             // Defensive sort: derep JSONs produced by older versions (or by
@@ -411,9 +412,11 @@ fn detect_nq(all_inputs: &[Vec<RawInput>]) -> usize {
     let max_q = all_inputs
         .iter()
         .flat_map(|s| s.iter())
-        .filter_map(|r| r.quals.as_deref())
-        .flat_map(|qs| qs.iter().copied())
-        .map(|q| q.round() as usize)
+        .filter_map(|r| r.quals.as_deref().map(|s| (s, r.abundance)))
+        .flat_map(|(s, ab)| {
+            s.iter()
+                .map(move |&x| (x as f64 / ab as f64).round() as usize)
+        })
         .max()
         .unwrap_or(40);
     max_q + 1
@@ -543,13 +546,14 @@ fn build_trans_mat(
                     Some(ci) => ci,
                     None => return (trans, buf),
                 };
-                let quals = match &inp.quals {
+                let sums = match &inp.quals {
                     Some(q) => q.as_slice(),
                     None => return (trans, buf),
                 };
+                let count = inp.abundance as f64;
 
                 let seq: Vec<u8> = inp.seq.bytes().map(nt_encode).collect();
-                let raw_query = Raw::new(seq, Some(quals), inp.abundance, false);
+                let raw_query = Raw::from_qual_sums(seq, Some(sums), inp.abundance, false);
                 let raw_center = &center_raws[ci];
 
                 // Align center (ref = al0) against the raw (query = al1).
@@ -566,7 +570,7 @@ fn build_trans_mat(
                     let nt1 = al_qry[alpos];
                     let qry_is_nt = matches!(nt1, 1..=4);
                     if matches!(nt0, 1..=4) && qry_is_nt {
-                        let q = (quals[qpos].round() as usize).min(nq - 1);
+                        let q = ((sums[qpos] as f64 / count).round() as usize).min(nq - 1);
                         let row = (nt0 as usize - 1) * 4 + (nt1 as usize - 1);
                         trans[row * nq + q] = trans[row * nq + q].saturating_add(reads);
                     }

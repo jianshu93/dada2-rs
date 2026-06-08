@@ -10,13 +10,19 @@ use rayon::prelude::*;
 ///   by sequence (lexical, ascending). Matches R `derepFastq` ordering, where
 ///   `qtables2` builds uniques in lexical order and the final stable
 ///   `order(decreasing=TRUE)` leaves equal-count uniques in that lexical order.
-/// - `quals`:   mean Phred quality score per position for each unique sequence;
-///              `quals[i][j]` is the mean score at position `j` for unique `i`.
+/// - `quals`:   per-position *integer* Phred quality SUM over the reads in each
+///              unique (deferred division, issue #23); `quals[i][j]` is the
+///              summed score at position `j` for unique `i`. Consumers recover
+///              the mean on demand as `sum / count` (the unique's abundance) —
+///              the per-position count equals the unique's read count because
+///              dereplication groups by exact full-sequence identity, so every
+///              read covers every position. Storing the sum is bit-identical to
+///              the old f64 mean while using 4 bytes/position instead of 8.
 /// - `map`:     for each input read (in order), the index into `uniques` of the
 ///              unique sequence it maps to.
 pub struct Derep {
     pub uniques: Vec<(Vec<u8>, u64)>,
-    pub quals: Vec<Vec<f64>>,
+    pub quals: Vec<Vec<u32>>,
     pub map: Vec<usize>,
 }
 
@@ -114,16 +120,14 @@ impl PartialDerep {
     }
 
     fn into_derep(self) -> Derep {
-        let quals: Vec<Vec<f64>> = self
+        // Keep the integer per-position sum (deferred division, issue #23):
+        // consumers divide by the unique's count on demand. `qual_cnts` is
+        // redundant under exact-match dereplication (every read covers every
+        // position), so it equals the unique's count and we don't store it.
+        let quals: Vec<Vec<u32>> = self
             .qual_sums
             .iter()
-            .zip(self.qual_cnts.iter())
-            .map(|(sums, cnts)| {
-                sums.iter()
-                    .zip(cnts.iter())
-                    .map(|(&s, &c)| if c > 0 { s / c as f64 } else { 0.0 })
-                    .collect()
-            })
+            .map(|sums| sums.iter().map(|&s| s.round() as u32).collect())
             .collect();
 
         let n = self.seq_order.len();
@@ -150,11 +154,11 @@ impl PartialDerep {
         // entry from old → new index.
         let mut new_seq_order: Vec<Vec<u8>> = Vec::with_capacity(n);
         let mut new_counts: Vec<u64> = Vec::with_capacity(n);
-        let mut new_quals: Vec<Vec<f64>> = Vec::with_capacity(n);
+        let mut new_quals: Vec<Vec<u32>> = Vec::with_capacity(n);
         let mut old_to_new: Vec<usize> = vec![0; n];
         let seq_order_owned = self.seq_order;
         let mut seq_iter: Vec<Option<Vec<u8>>> = seq_order_owned.into_iter().map(Some).collect();
-        let mut quals_iter: Vec<Option<Vec<f64>>> = quals.into_iter().map(Some).collect();
+        let mut quals_iter: Vec<Option<Vec<u32>>> = quals.into_iter().map(Some).collect();
         for (new_idx, &old_idx) in order.iter().enumerate() {
             old_to_new[old_idx] = new_idx;
             new_seq_order.push(seq_iter[old_idx].take().unwrap());

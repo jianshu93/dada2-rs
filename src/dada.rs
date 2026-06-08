@@ -99,9 +99,23 @@ pub struct RawInput {
     pub abundance: u32,
     /// When `true`, this sequence is presumed genuine regardless of p-value.
     pub prior: bool,
-    /// Per-position Phred quality scores. Must have the same length as `seq`
-    /// if provided. Supply `None` when quality data is unavailable.
-    pub quals: Option<Vec<f64>>,
+    /// Per-position *integer* Phred quality SUM over the reads in this unique
+    /// (deferred division, issue #23). Must have the same length as `seq` when
+    /// present; `None` when quality data is unavailable.
+    ///
+    /// We store the integer sum rather than the f64 mean for compactness: 4
+    /// bytes/position instead of 8, which roughly halves the dominant resident
+    /// field across all samples held in memory. The mean Phred the rest of the
+    /// pipeline consumes is recovered on demand via [`RawInput::mean_quals`] as
+    /// `sum / abundance`.
+    ///
+    /// This is bit-identical to storing the f64 mean: the sum is exact, and
+    /// `abundance` is the per-position read count for every covered position
+    /// because dereplication groups by exact full-sequence identity (all reads
+    /// in a unique are byte-identical → identical length → full coverage). If
+    /// approximate/length-collapsing dereplication is ever introduced, this
+    /// representation must carry per-position counts too.
+    pub quals: Option<Vec<u32>>,
 }
 
 /// Per-cluster summary produced by `dada_uniques`.
@@ -281,7 +295,7 @@ pub fn dada_uniques_cached(
                     } else {
                         None
                     };
-                    let mut raw = Raw::new(seq, qual, inp.abundance, inp.prior);
+                    let mut raw = Raw::from_qual_sums(seq, qual, inp.abundance, inp.prior);
                     raw.index = i as u32;
                     raw
                 })
