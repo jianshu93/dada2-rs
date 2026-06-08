@@ -4,6 +4,40 @@ use std::io::{self, BufReader};
 use noodles::fastq;
 use rayon::prelude::*;
 
+/// Per-position Phred quality sums are stored as `u32` (deferred division,
+/// issue #23: keep the integer sum and divide by abundance on demand).
+///
+/// **Capacity cap.** A sum overflows `u32` only when a *single* unique sequence
+/// accumulates more than `u32::MAX / Q_max` reads. With the Phred ceiling (~93)
+/// that is roughly **46 million reads of one byte-identical sequence** — far
+/// beyond any realistic dataset (per-sample totals rarely exceed ~1M paired-end;
+/// 46M reads of one *exact* sequence would imply ~1B+ reads pooled into highly
+/// repetitive data). If this is ever hit, the fix is to widen the qual-sum
+/// storage (`RawInput.quals` / `Derep.quals`) to `u64`. Until then we fail
+/// loudly via [`checked_qual_sum`] rather than silently saturate.
+pub const QUAL_SUM_MAX: u32 = u32::MAX;
+
+/// Convert an accumulated per-position Phred sum (`f64`, but integer-valued) to
+/// the stored `u32`, panicking with a clear, actionable message on overflow
+/// instead of silently saturating — `f64 as u32` clamps to `u32::MAX`, which
+/// would corrupt the recovered mean quality without any signal. See
+/// [`QUAL_SUM_MAX`] for when this can happen (essentially never).
+#[inline]
+pub fn checked_qual_sum(sum: f64) -> u32 {
+    assert!(
+        sum <= QUAL_SUM_MAX as f64,
+        "per-position Phred quality sum ({sum:.0}) overflows u32: a single unique \
+         sequence has more than ~46M reads. dada2-rs stores quality as integer \
+         sums per position (issue #23); to support data this deep, widen \
+         RawInput.quals / Derep.quals to u64. Please open an issue reporting your \
+         per-sample read counts."
+    );
+    // Negatives (malformed quals below the Phred offset) pass the cap check and,
+    // as before, saturate to 0 here — that pathology is handled upstream, not by
+    // this overflow guard.
+    sum.round() as u32
+}
+
 /// Mirrors the R dada2 `derep` class.
 ///
 /// - `uniques`: unique sequences sorted by read count descending, ties broken
@@ -127,7 +161,7 @@ impl PartialDerep {
         let quals: Vec<Vec<u32>> = self
             .qual_sums
             .iter()
-            .map(|sums| sums.iter().map(|&s| s.round() as u32).collect())
+            .map(|sums| sums.iter().map(|&s| checked_qual_sum(s)).collect())
             .collect();
 
         let n = self.seq_order.len();
@@ -244,4 +278,26 @@ pub fn dereplicate<R: io::Read>(
         );
     }
     Ok(derep)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checked_qual_sum_passes_through_in_range() {
+        assert_eq!(checked_qual_sum(0.0), 0);
+        assert_eq!(checked_qual_sum(37.4), 37); // rounds like the f64-mean path did
+        assert_eq!(checked_qual_sum(QUAL_SUM_MAX as f64), QUAL_SUM_MAX);
+        // Negative (malformed quals below the Phred offset) saturates to 0 as before.
+        assert_eq!(checked_qual_sum(-5.0), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "overflows u32")]
+    fn checked_qual_sum_panics_on_overflow() {
+        // ~46M reads of one unique at Q40 would land here; we fail loudly rather
+        // than silently saturate to u32::MAX.
+        checked_qual_sum(QUAL_SUM_MAX as f64 + 1.0);
+    }
 }
