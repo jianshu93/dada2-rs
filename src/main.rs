@@ -987,7 +987,7 @@ fn main() -> io::Result<()> {
                         quals: Some(
                             merged_qual_sum[i]
                                 .iter()
-                                .map(|&s| s.round() as u32)
+                                .map(|&s| derep::checked_qual_sum(s))
                                 .collect(),
                         ),
                         seq: sequence,
