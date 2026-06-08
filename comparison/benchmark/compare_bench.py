@@ -24,11 +24,18 @@ Usage:
 
   PATH is the CSV itself OR a directory containing it (summary.csv by default,
   or the sweep CSV when --kind is given). LABEL is any short name (e.g. main,
-  branch, k5, j4).
+  branch, k5, j4). PATH may also be a comma-separated list of CSVs/dirs — repeated
+  runs (reps) of the same config — which are reduced to the median per metric with
+  the spread shown (`median ±N%`), so within-node noise is visible at a glance.
 
 Examples:
   # peak RSS + wall, main build vs the deferred-division branch (issue #23)
   compare_bench.py --baseline main=bench_main --compare branch=bench_branch
+
+  # reps: 3 runs per config, reported as median ±half-range
+  compare_bench.py \\
+      --baseline main=run1_main,run2_main,run3_main \\
+      --compare branch=run1_br,run2_br,run3_br
 
   # just peak RSS, three runs
   compare_bench.py --metric maxrss_kb \\
@@ -45,6 +52,7 @@ Pure stdlib; no dependencies.
 import argparse
 import csv
 import json
+import statistics
 import sys
 from pathlib import Path
 
@@ -77,16 +85,27 @@ LOWER_IS_BETTER = {"wall_s", "cpu_s", "maxrss_kb"}
 
 
 def parse_run(spec, default_file):
-    """'label=path' -> (label, csv_path). path may be the CSV or its dir."""
+    """'label=path[,path...]' -> (label, [csv_path, ...]). Each path may be a CSV
+    file or a directory containing the kind's CSV. Multiple comma-separated paths
+    are repeated runs (reps) of the same configuration — reduced to the median per
+    metric, with the spread reported so within-node noise is visible."""
     if "=" not in spec:
-        sys.exit(f"--baseline/--compare expects LABEL=PATH, got: {spec!r}")
+        sys.exit(f"--baseline/--compare expects LABEL=PATH[,PATH...], got: {spec!r}")
     label, raw = spec.split("=", 1)
-    p = Path(raw)
-    if p.is_dir():
-        p = p / default_file
-    if not p.is_file():
-        sys.exit(f"{label}: not a file: {p}")
-    return label, p
+    paths = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        p = Path(item)
+        if p.is_dir():
+            p = p / default_file
+        if not p.is_file():
+            sys.exit(f"{label}: not a file: {p}")
+        paths.append(p)
+    if not paths:
+        sys.exit(f"{label}: no paths given")
+    return label, paths
 
 
 def detect_kind(path):
@@ -119,6 +138,34 @@ def load(path, kind, stack):
     return rows, order
 
 
+def load_reps(paths, kind, stack):
+    """Load N rep CSVs for one label and reduce each metric to the MEDIAN across
+    reps. Returns (rows, order, spread, nreps): rows[key][metric] = median, and
+    spread[key][metric] = relative half-range ((max-min)/2/median) or None (single
+    rep / zero median). Keys missing from a rep are simply absent from its median."""
+    per_rep, order = [], []
+    for path in paths:
+        rows, od = load(path, kind, stack)
+        per_rep.append(rows)
+        for k in od:
+            if k not in order:
+                order.append(k)
+    spec = KINDS[kind]
+    rows, spread = {}, {}
+    for k in order:
+        rows[k], spread[k] = {}, {}
+        for m in spec["metrics"]:
+            vals = [r[k][m] for r in per_rep if k in r and r[k].get(m) is not None]
+            if not vals:
+                rows[k][m] = spread[k][m] = None
+                continue
+            med = statistics.median(vals)
+            rows[k][m] = med
+            spread[k][m] = ((max(vals) - min(vals)) / 2 / med
+                            if len(vals) > 1 and med else None)
+    return rows, order, spread, len(paths)
+
+
 def fmt(metric, v):
     if v is None:
         return "—"
@@ -141,24 +188,35 @@ def pct(base, v):
 
 
 def print_table(metric, keys, runs, base_label):
-    """runs = list of (label, rows_dict); base_label is the baseline's label."""
+    """runs = list of (label, rows, spread, nreps); base_label is the baseline's.
+    With reps, each cell shows `median ±spread%` and Δ% compares medians."""
     arrow = "↓ better" if metric in LOWER_IS_BETTER else "↑ better"
     print(f"\n### {metric}  ({arrow})")
-    # Column layout: key | base value | (value, Δ%) per compare run.
+    any_reps = any(nr > 1 for *_, nr in runs)
+    vw = 18 if any_reps else 12   # wider value column when ±spread is shown
     klen = max([len("step")] + [len(k) for k in keys])
-    head = f"{'':<{klen}}  {base_label:>12}"
-    for label, _ in runs[1:]:
-        head += f"  {label:>12}{'Δ%':>8}"
+
+    def cell(rows, spread, k):
+        v = rows.get(k, {}).get(metric)
+        s = (spread.get(k) or {}).get(metric)
+        txt = fmt(metric, v)
+        if s is not None:
+            txt += f" ±{s * 100:.0f}%"
+        return txt, v
+
+    head = f"{'':<{klen}}  {base_label:>{vw}}"
+    for label, *_ in runs[1:]:
+        head += f"  {label:>{vw}}{'Δ%':>8}"
     print(head)
-    base_rows = runs[0][1]
+    _, base_rows, base_spread, _ = runs[0]
     for k in keys:
-        base_v = base_rows.get(k, {}).get(metric)
-        line = f"{k:<{klen}}  {fmt(metric, base_v):>12}"
-        for _, rows in runs[1:]:
-            v = rows.get(k, {}).get(metric)
+        btxt, base_v = cell(base_rows, base_spread, k)
+        line = f"{k:<{klen}}  {btxt:>{vw}}"
+        for _, rows, spread, _ in runs[1:]:
+            txt, v = cell(rows, spread, k)
             d = pct(base_v, v)
             dstr = "—" if d is None else f"{d:+.1f}%"
-            line += f"  {fmt(metric, v):>12}{dstr:>8}"
+            line += f"  {txt:>{vw}}{dstr:>8}"
         print(line)
 
 
@@ -184,12 +242,12 @@ def main():
 
     # Resolve the baseline first so we can auto-detect the kind from its header.
     kind = args.kind
-    base_label, base_path = parse_run(
+    base_label, base_paths = parse_run(
         args.baseline, KINDS[kind]["file"] if kind else "summary.csv")
     if kind is None:
-        kind = detect_kind(base_path)
+        kind = detect_kind(base_paths[0])
         # Re-resolve in case the dir holds a non-default file for this kind.
-        base_label, base_path = parse_run(args.baseline, KINDS[kind]["file"])
+        base_label, base_paths = parse_run(args.baseline, KINDS[kind]["file"])
 
     spec = KINDS[kind]
     metrics = args.metric or spec["metrics"]
@@ -198,22 +256,27 @@ def main():
             sys.exit(f"metric {m!r} not in {kind} CSV (have: {', '.join(spec['metrics'])})")
 
     runs, key_order = [], []
-    for label, path in [(base_label, base_path)] + [
+    for label, paths in [(base_label, base_paths)] + [
             parse_run(c, spec["file"]) for c in args.compare]:
-        rows, order = load(path, kind, args.stack)
+        rows, order, spread, nreps = load_reps(paths, kind, args.stack)
         if not rows:
             where = f" (stack={args.stack})" if kind == "summary" else ""
-            sys.exit(f"{label}: no rows in {path}{where}")
-        runs.append((label, rows))
+            sys.exit(f"{label}: no rows in {', '.join(map(str, paths))}{where}")
+        runs.append((label, rows, spread, nreps))
         for k in order:
             if k not in key_order:
                 key_order.append(k)
 
-    label_desc = ", ".join(l for l, _ in runs[1:])
+    def label_n(label, nreps):
+        return f"{label} (n={nreps})" if nreps > 1 else label
+
+    label_desc = ", ".join(label_n(l, nr) for l, _, _, nr in runs[1:])
     print("=" * 64)
     print(f"BENCH COMPARE — {kind}"
           + (f" (stack={args.stack})" if kind == "summary" else "")
-          + f"\nbaseline: {base_label}   vs: {label_desc}")
+          + f"\nbaseline: {label_n(base_label, runs[0][3])}   vs: {label_desc}")
+    if any(nr > 1 for *_, nr in runs):
+        print("(values are medians across reps; ±N% = relative half-range)")
     print("=" * 64)
     for m in metrics:
         print_table(m, key_order, runs, base_label)
@@ -221,7 +284,8 @@ def main():
     if args.json:
         out = {"kind": kind, "stack": args.stack if kind == "summary" else None,
                "baseline": base_label, "metrics": metrics,
-               "runs": {label: rows for label, rows in runs}}
+               "runs": {label: {"nreps": nr, "median": rows, "spread": spread}
+                        for label, rows, spread, nr in runs}}
         Path(args.json).write_text(json.dumps(out, indent=2))
         print(f"\nWrote {args.json}")
 
