@@ -457,6 +457,76 @@ fn merge_pairs_is_deterministic_across_threads() {
     );
 }
 
+/// With an impossibly high --min-overlap every pair fails to merge. By default
+/// those pairs are dropped; with --rescue-unmerged they are concatenated and
+/// accepted (marked `concatenated: true`).
+#[test]
+fn merge_pairs_rescue_unmerged_concatenates() {
+    let dir = scratch("merge_rescue");
+    let err = shared_err_model();
+    let f1 = fixture("sam1F.fastq.gz");
+    let r1 = fixture("sam1R.fastq.gz");
+
+    let dada = |inp: &Path, out: &Path| {
+        run(&[
+            "dada",
+            inp.to_str().unwrap(),
+            "--error-model",
+            err.to_str().unwrap(),
+            "--threads",
+            "1",
+            "-o",
+            out.to_str().unwrap(),
+        ]);
+    };
+    let (f1j, r1j) = (dir.join("f1.json"), dir.join("r1.json"));
+    dada(&f1, &f1j);
+    dada(&r1, &r1j);
+
+    let merge = |out: &Path, extra: &[&str]| {
+        let mut args = vec![
+            "merge-pairs",
+            "--fwd-dada",
+            f1j.to_str().unwrap(),
+            "--rev-dada",
+            r1j.to_str().unwrap(),
+            "--fwd-fastq",
+            f1.to_str().unwrap(),
+            "--rev-fastq",
+            r1.to_str().unwrap(),
+            "--min-overlap",
+            "5000",
+            "-o",
+            out.to_str().unwrap(),
+        ];
+        args.extend_from_slice(extra);
+        run(&args);
+    };
+
+    // Default: nothing merges, nothing rescued.
+    let plain = dir.join("plain.json");
+    merge(&plain, &[]);
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&plain).unwrap()).unwrap();
+    let sample = &v["samples"][0];
+    assert_eq!(sample["accepted_pairs"].as_u64().unwrap(), 0);
+    assert_eq!(sample["merged"].as_array().unwrap().len(), 0);
+
+    // Rescue: every distinct pair is concatenated and accepted.
+    let rescued = dir.join("rescued.json");
+    merge(&rescued, &["--rescue-unmerged", "--concat-nnn-len", "10"]);
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&rescued).unwrap()).unwrap();
+    let sample = &v["samples"][0];
+    assert!(sample["accepted_pairs"].as_u64().unwrap() > 0);
+    let merged = sample["merged"].as_array().unwrap();
+    assert!(!merged.is_empty());
+    for m in merged {
+        assert!(m["accept"].as_bool().unwrap());
+        assert!(m["concatenated"].as_bool().unwrap());
+        // Concatenated sequence carries the N spacer.
+        assert!(m["sequence"].as_str().unwrap().contains("NNNNNNNNNN"));
+    }
+}
+
 #[test]
 fn dada_multi_input_matches_per_file_runs() {
     let dir = scratch("multi");
