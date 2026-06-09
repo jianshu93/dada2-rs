@@ -136,6 +136,34 @@ leaner (8.18 GB vs 14.86 GB) — R's resident-derep cache is not magically compa
 See [issue #22](https://github.com/HPCBio/dada2-rs/issues/22) for the keep-but-default-off
 decision.
 
+### Pooled `--pool true`: pre/post-update A/B
+
+A dada2-rs-vs-itself regression check on the pooled path (PacBio, node-exclusive,
+no cache flag): **`pre`** is `main` before the memory/speed work, **`post`** is
+current `main`. This spans the whole update window — it is a *composite* of the
+memory-representation change (#23, `qual_sum:[u32]` deferred division) and the
+`learn-errors`/`dada` speedups (issue #3 checklist: skip per-iteration setup,
+parallel `build_trans_mat`, SIMD `kmer_dist8`) — not an isolated change. R is not a
+variable here, so no R numbers apply.
+
+| k | step | metric | pre | post | Δ |
+|---|---|---|---:|---:|---:|
+| 5 | dada | wall (s) | 4909.8 | 4178.2 | **−14.9%** |
+| 5 | dada | CPU (s) | 112853.6 | 95364.9 | **−15.5%** |
+| 5 | dada | peak | 36.14 GB | 28.61 GB | **−20.8%** |
+| 5 | learn | wall (s) | 84.8 | 72.3 | **−14.7%** |
+| 7 | dada | wall (s) | 4906.6 | 4200.3 | **−14.4%** |
+| 7 | dada | CPU (s) | 112767.9 | 95628.5 | **−15.2%** |
+| 7 | dada | peak | 36.04 GB | 28.69 GB | **−20.4%** |
+| 7 | learn | wall (s) | 84.4 | 71.9 | **−14.7%** |
+
+**Verdict:** improvement across the board, consistent between k=5 and k=7. The `dada`
+wall and CPU fall together (~−15%) at flat cores (−0.7 to −1.0%), i.e. genuinely less
+work rather than better parallel packing; peak RSS drops ~20% (~7.5 GB off the pooled
+high-water mark). Pooled `dada` peak is ~36 GB at both k values — at pooled scale the
+resident all-samples data dominates RSS, so the 4^k screen array is washed out and the
+memory win is representation-driven, not k-related.
+
 ## Illumina MiSeq (F1000, 384 samples)
 
 Run using 24 threads using release-native `dada2-rs`, `v0.1.1-a20fee47`.
