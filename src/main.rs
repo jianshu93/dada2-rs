@@ -665,22 +665,6 @@ fn main() -> io::Result<()> {
 
             // ---- Serialize output ----
             #[derive(Serialize)]
-            struct AsvEntry {
-                sequence: String,
-                abundance: u32,
-                birth_type: String,
-                birth_pval: f64,
-                birth_fold: f64,
-                birth_e: f64,
-            }
-
-            #[derive(Serialize)]
-            struct DadaStats {
-                nalign: u32,
-                nshroud: u32,
-            }
-
-            #[derive(Serialize)]
             struct ClusterStatJson {
                 sequence: String,
                 abundance: u32,
@@ -739,28 +723,7 @@ fn main() -> io::Result<()> {
             let asvs: Vec<AsvEntry> = result
                 .clusters
                 .iter()
-                .map(|c| {
-                    let sequence: String = c
-                        .sequence
-                        .iter()
-                        .map(|&b| misc::nt_decode(b) as char)
-                        .collect();
-                    let birth_type = match &c.birth_type {
-                        BirthType::Initial => "Initial",
-                        BirthType::Abundance => "Abundance",
-                        BirthType::Prior => "Prior",
-                        BirthType::Singleton => "Singleton",
-                    }
-                    .to_string();
-                    AsvEntry {
-                        sequence,
-                        abundance: c.reads,
-                        birth_type,
-                        birth_pval: c.birth_pval,
-                        birth_fold: c.birth_fold,
-                        birth_e: c.birth_e,
-                    }
-                })
+                .map(|c| asv_entry_from_cluster(c, c.reads))
                 .collect();
 
             let aux_json = result.aux.as_ref().map(|a| {
@@ -827,13 +790,7 @@ fn main() -> io::Result<()> {
                 aux: aux_json,
             };
 
-            let tagged = Tagged::new("dada", out);
-            let json = if compact {
-                serde_json::to_string(&tagged)
-            } else {
-                serde_json::to_string_pretty(&tagged)
-            }
-            .map_err(io::Error::other)?;
+            let json = to_json(&Tagged::new("dada", out), compact)?;
 
             match output {
                 Some(path) => std::fs::write(&path, &json)?,
@@ -1075,20 +1032,6 @@ fn main() -> io::Result<()> {
             // ---- Per-sample output ----
             let t_output = std::time::Instant::now();
             #[derive(Serialize)]
-            struct AsvEntry {
-                sequence: String,
-                abundance: u32,
-                birth_type: String,
-                birth_pval: f64,
-                birth_fold: f64,
-                birth_e: f64,
-            }
-            #[derive(Serialize)]
-            struct DadaStats {
-                nalign: u32,
-                nshroud: u32,
-            }
-            #[derive(Serialize)]
             struct DadaOutput {
                 sample: String,
                 num_asvs: usize,
@@ -1116,26 +1059,7 @@ fn main() -> io::Result<()> {
                         continue;
                     }
                     global_to_local[c] = Some(asvs.len());
-                    let sequence: String = cluster
-                        .sequence
-                        .iter()
-                        .map(|&b| misc::nt_decode(b) as char)
-                        .collect();
-                    let birth_type = match &cluster.birth_type {
-                        BirthType::Initial => "Initial",
-                        BirthType::Abundance => "Abundance",
-                        BirthType::Prior => "Prior",
-                        BirthType::Singleton => "Singleton",
-                    }
-                    .to_string();
-                    asvs.push(AsvEntry {
-                        sequence,
-                        abundance: cluster_reads[c],
-                        birth_type,
-                        birth_pval: cluster.birth_pval,
-                        birth_fold: cluster.birth_fold,
-                        birth_e: cluster.birth_e,
-                    });
+                    asvs.push(asv_entry_from_cluster(cluster, cluster_reads[c]));
                 }
 
                 let total_reads: u32 = cluster_reads.iter().sum();
@@ -1162,13 +1086,7 @@ fn main() -> io::Result<()> {
                     map,
                 };
 
-                let tagged = Tagged::new("dada-pooled", out);
-                let json = if compact {
-                    serde_json::to_string(&tagged)
-                } else {
-                    serde_json::to_string_pretty(&tagged)
-                }
-                .map_err(io::Error::other)?;
+                let json = to_json(&Tagged::new("dada-pooled", out), compact)?;
 
                 let path = output_dir.join(format!("{sample_name}.json"));
                 std::fs::write(&path, &json)?;
@@ -3769,6 +3687,62 @@ fn mark_priors(
 /// the multi-input `dada` path and by `dada-pseudo`. The single-input `dada`
 /// path keeps its own inline serialization because it also emits aux outputs
 /// and cluster traces.
+/// One ASV record in a dada-family output JSON. Shared by the single-input
+/// `dada`, `dada-pooled`, and the multi-sample `dada` / `dada-pseudo` paths.
+#[derive(Serialize)]
+struct AsvEntry {
+    sequence: String,
+    abundance: u32,
+    birth_type: String,
+    birth_pval: f64,
+    birth_fold: f64,
+    birth_e: f64,
+}
+
+#[derive(Serialize)]
+struct DadaStats {
+    nalign: u32,
+    nshroud: u32,
+}
+
+/// Stable string label for a cluster's birth type (matches R DADA2's `$type`).
+fn birth_type_str(bt: &BirthType) -> &'static str {
+    match bt {
+        BirthType::Initial => "Initial",
+        BirthType::Abundance => "Abundance",
+        BirthType::Prior => "Prior",
+        BirthType::Singleton => "Singleton",
+    }
+}
+
+/// Build an [`AsvEntry`] from a cluster summary, decoding its center sequence.
+/// `abundance` is passed explicitly because the pooled per-sample path uses a
+/// recomputed per-sample read count rather than `cluster.reads`.
+fn asv_entry_from_cluster(cluster: &dada::ClusterSummary, abundance: u32) -> AsvEntry {
+    AsvEntry {
+        sequence: cluster
+            .sequence
+            .iter()
+            .map(|&b| misc::nt_decode(b) as char)
+            .collect(),
+        abundance,
+        birth_type: birth_type_str(&cluster.birth_type).to_string(),
+        birth_pval: cluster.birth_pval,
+        birth_fold: cluster.birth_fold,
+        birth_e: cluster.birth_e,
+    }
+}
+
+/// Serialize a value to JSON, compact or pretty per `compact`.
+fn to_json<T: Serialize>(value: &T, compact: bool) -> io::Result<String> {
+    if compact {
+        serde_json::to_string(value)
+    } else {
+        serde_json::to_string_pretty(value)
+    }
+    .map_err(io::Error::other)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn denoise_and_serialize(
     tag: &'static str,
@@ -3780,20 +3754,6 @@ fn denoise_and_serialize(
     compact: bool,
     verbose: bool,
 ) -> io::Result<String> {
-    #[derive(Serialize)]
-    struct AsvEntry {
-        sequence: String,
-        abundance: u32,
-        birth_type: String,
-        birth_pval: f64,
-        birth_fold: f64,
-        birth_e: f64,
-    }
-    #[derive(Serialize)]
-    struct DadaStats {
-        nalign: u32,
-        nshroud: u32,
-    }
     #[derive(Serialize)]
     struct DadaOutput {
         sample: String,
@@ -3823,28 +3783,7 @@ fn denoise_and_serialize(
     let asvs: Vec<AsvEntry> = result
         .clusters
         .iter()
-        .map(|c| {
-            let sequence: String = c
-                .sequence
-                .iter()
-                .map(|&b| misc::nt_decode(b) as char)
-                .collect();
-            let birth_type = match &c.birth_type {
-                BirthType::Initial => "Initial",
-                BirthType::Abundance => "Abundance",
-                BirthType::Prior => "Prior",
-                BirthType::Singleton => "Singleton",
-            }
-            .to_string();
-            AsvEntry {
-                sequence,
-                abundance: c.reads,
-                birth_type,
-                birth_pval: c.birth_pval,
-                birth_fold: c.birth_fold,
-                birth_e: c.birth_e,
-            }
-        })
+        .map(|c| asv_entry_from_cluster(c, c.reads))
         .collect();
 
     let mut run_params = *run_params;
@@ -3863,13 +3802,7 @@ fn denoise_and_serialize(
         map: result.map,
     };
 
-    let tagged = Tagged::new(tag, out);
-    if compact {
-        serde_json::to_string(&tagged)
-    } else {
-        serde_json::to_string_pretty(&tagged)
-    }
-    .map_err(io::Error::other)
+    to_json(&Tagged::new(tag, out), compact)
 }
 
 /// Build a [`derep::Derep`] for `dada` / `dada-pooled` from either a FASTQ file
