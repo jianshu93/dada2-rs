@@ -66,8 +66,11 @@ def label_for(spec):
 
 
 def scorecard(specs, rstack):
-    # RSS ratio is R ÷ dada2-rs: >1× = dada2-rs uses less, <1× = dada2-rs uses more.
-    print("| Run | dada2-rs wall (s) | R wall (s) | Speedup | dada2-rs peak (MB) | R peak (MB) | Peak RSS (R÷rs) |")
+    # RSS ratio is dada2-rs ÷ R (fraction of the comparator's memory): <1× =
+    # dada2-rs uses less, >1× = more. This reads as a reduction directly and
+    # handles wins+increases in one column, so it runs OPPOSITE to Speedup
+    # (R ÷ dada2-rs, where higher is better). See docs/results.md methodology.
+    print("| Run | dada2-rs wall (s) | R wall (s) | Speedup | dada2-rs peak (MB) | R peak (MB) | Peak RSS (rs÷R) |")
     print("|---|---:|---:|---:|---:|---:|---:|")
     for spec in specs:
         lab, path = label_for(spec)
@@ -77,7 +80,7 @@ def scorecard(specs, rstack):
         rrss = fnum(rows, "dada2-rs", "TOTAL", "maxrss_kb")
         rrss_r = fnum(rows, rstack, "TOTAL", "maxrss_kb")
         print(f"| {lab} | {secs(rw)} | {secs(rr)} | {ratio(rr, rw)} | "
-              f"{mb(rrss)} | {mb(rrss_r)} | {ratio(rrss_r, rrss)} |")
+              f"{mb(rrss)} | {mb(rrss_r)} | {ratio(rrss, rrss_r)} |")
 
 
 # Pipeline step order (illumina superset; pacbio steps are a subset).
