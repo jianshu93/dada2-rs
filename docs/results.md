@@ -43,7 +43,7 @@ PacBio is benchmarked from `--kmer-size 5` (matched to R's fixed
 `KMER_SIZE = 5` — isolates kernel + threading speed) to `--kmer-size 7`
 (dada2-rs recommended default for PacBio — adds the k-mer screen-effectiveness gain). See the [PacBio notes](benchmarking.md#7-pacbio-vs-illumina-specifics).
 
-** Results in progress, more to be added **
+*Overall workflow (remove-primers FASTQ -> removing chimeras)*
 
 | Run | Pooling mode | k-mer | sample jobs | dada2-rs wall (s) | R wall (s) | Speedup (rs vs R) | dada2-rs peak (MB) | R peak (MB) | Peak RSS (rs vs R) |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -194,19 +194,21 @@ The majority of recent memory work focused on PacBio data. How does this affect 
 
 | Run | dada2-rs wall (s) | R wall (s) | Speedup | dada2-rs peak (MB) | R peak (MB) | Peak RSS (R÷rs) |
 |---|---:|---:|---:|---:|---:|---:|
-| MiSeqSOP_pooled_k5 | 544.5 | 1361.4 | **2.5×** | 4535 | 6082 | 1.3× |
-| MiSeqSOP_pooled_k6 | 488.9 | 1361.4* | **2.8x** | 4529 | 6082* | 1.3x |
-| MiSeqSOP_pooled_k7 | 487.0 | 1361.4* | **2.8x** | 4521 | 6082* | 1.3x |
-| MiSeqSOP_pseudo_k5 | 245.2 | 1158.1 | **4.7×** | 2208 | 1841 | 0.8× |
-| MiSeqSOP_pseudo_k6 | 246.5 | 1158.1* | **4.7x** | 2229 | 1841* | 0.8x |
-| MiSeqSOP_pseudo_k7 | 244.8 | 1158.1* | **4.7x** | 2242 | 1841* | 0.8x |
-| MiSeqSOP_nopool_k5 | 132.3 | 778.7 | **5.9×** | 1457 | 1659 | 1.1× |
-| MiSeqSOP_nopool_k6 | 151.1 | 778.7* | **5.2x** | 1542 | 1659* | 1.1x |
-| MiSeqSOP_nopool_k7 | 151.7 | 778.7* | **5.2x** | 1469 | 1659* | 1.1x |
+| MiSeqSOP_pooled_k5 | 417.8 | 1284.6  | **3.1×** | 3653 | 6105  | **0.6×** |
+| MiSeqSOP_pooled_k6 | 414.0 | 1284.6* | **3.1x** | 3666 | 6105* | **0.6x** |
+| MiSeqSOP_pooled_k7 | 416.1 | 1284.6* | **3.1x** | 3660 | 6105* | **0.6x** |
+| MiSeqSOP_pseudo_k5 | 165.6 | 1224.1  | **7.4×** | 1483 | 2001  | **0.7×** |
+| MiSeqSOP_pseudo_k6 | 165.5 | 1224.1* | **7.4×** | 1517 | 2001* | **0.8x** |
+| MiSeqSOP_pseudo_k7 | 164.8 | 1224.1* | **7.4×** | 1424 | 2001* | **0.7x** |
+| MiSeqSOP_nopool_k5 | 93.2  | 791.3   | **8.5×** | 1554 | 1673  | **0.9×** |
+| MiSeqSOP_nopool_k6 | 94.7  | 791.3   | **8.4x** | 1456 | 1673* | **0.9×** |
+| MiSeqSOP_nopool_k7 | 94.2  | 791.3   | **8.4x** | 1414 | 1673* | **0.9×** |
 
 `*` - values from k=5 run
 
-Moderate k-mer difference in pooled runs only, but an overall improvement in performance (2.5-5.9x). We only recommend k=5 for most runs, maybe k=6 for pooled runs.
+Tests prior to memory updates were from 2.4x (pooled, k=5) to 5.9x (no pooling, k=5). This round suggests a modest improvement: 3.1x to 8.5x, all at k=5. 
+
+Prior data also suggested a small improvement for pooled samples using a higher k-mer, but in this latest run it seems to disappear, replaced with an overall improvement in performance and memory. 
 
 ### Per step comparisons
 
@@ -214,45 +216,45 @@ Moderate k-mer difference in pooled runs only, but an overall improvement in per
 
 | Step | dada2-rs wall (s) | dada2-rs cores | dada2-rs peak (MB) | R wall (s) | Speedup |
 |---|---:|---:|---:|---:|---:|
-| filter | 13.7 | 20.9 | 23 | 40.9 | **3.0×** |
-| learn_fwd | 38.3 | 22.3 | 718 | 89.6 | **2.3×** |
-| learn_rev | 38.8 | 22.0 | 852 | 111.9 | **2.9×** |
-| dada_fwd | 251.2 | 15.8 | 4535 | 467.7 | **1.9×** |
-| dada_rev | 187.9 | 12.3 | 3622 | 368.3 | **2.0×** |
-| merge | 8.6 | 18.7 | 1569 | 256.3 | **29.7×** |
-| make_table | 0.5 | 1.0 | 329 | 0.3 | 0.6× |
-| remove_bimera | 5.5 | 21.9 | 47 | 4.2 | 0.8× |
-| TOTAL | 544.5 | 15.7 | 4535 | 1361.4 | **2.5×** |
+| filter | 11.4 | 20.3 | 21 | 30.8 | **2.7×** |
+| learn_fwd | 18.9 | 21.5 | 642 | 83.0 | **4.4×** |
+| learn_rev | 23.0 | 20.7 | 770 | 107.8 | **4.7×** |
+| dada_fwd | 196.1 | 12.9 | 3653 | 436.1 | **2.2×** |
+| dada_rev | 157.8 | 9.9 | 3009 | 355.1 | **2.3×** |
+| merge | 7.2 | 15.6 | 1652 | 245.8 | **34.1×** |
+| make_table | 0.6 | 1.0 | 337 | 0.3 | 0.5× |
+| remove_bimera | 2.8 | 23.1 | 47 | 2.6 | 0.9× |
+| TOTAL | 417.8 | 12.9 | 3653 | 1284.6 | **3.1×** |
 
 **MiSeqSOP, pseudo, k5** — dada2-rs vs R (R-single end-to-end wall)
 
 | Step | dada2-rs wall (s) | dada2-rs cores | dada2-rs peak (MB) | R wall (s) | Speedup |
 |---|---:|---:|---:|---:|---:|
-| filter | 13.2 | 21.0 | 21 | 36.4 | **2.8×** |
-| learn_fwd | 32.8 | 22.4 | 721 | 80.7 | **2.5×** |
-| learn_rev | 33.4 | 21.9 | 848 | 100.0 | **3.0×** |
-| dada_fwd | 96.7 | 20.1 | 2208 | 413.1 | **4.3×** |
-| dada_rev | 63.5 | 18.9 | 1551 | 303.4 | **4.8×** |
-| merge | 4.9 | 17.3 | 1583 | 203.9 | **41.6×** |
-| make_table | 0.2 | 1.0 | 139 | 0.1 | 0.7× |
-| remove_bimera | 0.4 | 17.3 | 21 | 0.3 | 0.9× |
-| TOTAL | 245.2 | 20.3 | 2208 | 1158.1 | **4.7×** |
+| filter | 11.3 | 20.4 | 21 | 31.7 | **2.8×** |
+| learn_fwd | 18.7 | 21.6 | 648 | 83.2 | **4.4×** |
+| learn_rev | 22.4 | 21.1 | 772 | 109.4 | **4.9×** |
+| dada_fwd | 65.4 | 20.8 | 686 | 433.9 | **6.6×** |
+| dada_rev | 43.1 | 19.9 | 568 | 332.9 | **7.7×** |
+| merge | 4.1 | 17.1 | 1483 | 208.9 | **51.5×** |
+| make_table | 0.2 | 1.0 | 144 | 0.1 | 0.6× |
+| remove_bimera | 0.3 | 20.6 | 21 | 0.2 | 0.8× |
+| TOTAL | 165.6 | 20.5 | 1483 | 1224.1 | **7.4×** |
 
 **MiSeqSOP, no pooling, k5** — dada2-rs vs R (R-single end-to-end wall)
 
 | Step | dada2-rs wall (s) | dada2-rs cores | dada2-rs peak (MB) | R wall (s) | Speedup |
 |---|---:|---:|---:|---:|---:|
-| filter | 13.3 | 20.9 | 21 | 35.5 | **2.7×** |
-| learn_fwd | 33.1 | 22.3 | 724 | 80.7 | **2.4×** |
-| learn_rev | 33.1 | 22.0 | 852 | 108.8 | **3.3×** |
-| dada_fwd | 30.2 | 20.9 | 594 | 197.0 | **6.5×** |
-| dada_rev | 18.8 | 20.2 | 470 | 142.4 | **7.6×** |
-| merge | 3.4 | 18.2 | 1457 | 193.7 | **56.6×** |
-| make_table | 0.1 | 1.0 | 60 | 0.1 | 1.2× |
-| remove_bimera | 0.3 | 11.6 | 21 | 0.2 | 0.6× |
-| TOTAL | 132.3 | 21.3 | 1457 | 778.7 | **5.9×** |
+| filter | 11.2 | 20.6 | 21 | 31.1 | 2.8× |
+| learn_fwd | 19.0 | 21.5 | 635 | 80.8 | 4.3× |
+| learn_rev | 22.4 | 21.0 | 769 | 107.6 | 4.8× |
+| dada_fwd | 22.2 | 19.9 | 573 | 196.4 | 8.8× |
+| dada_rev | 14.8 | 19.0 | 467 | 155.5 | 10.5× |
+| merge | 3.4 | 15.5 | 1554 | 198.5 | 59.1× |
+| make_table | 0.1 | 1.0 | 62 | 0.1 | 1.0× |
+| remove_bimera | 0.1 | 17.8 | 21 | 0.1 | 0.8× |
+| TOTAL | 93.2 | 20.2 | 1554 | 791.3 | 8.5× |
 
-Notably the big improvement is with `merge-pairs`, largely due to threading, though overall steps are all faster.
+Notably the big improvement is with `merge-pairs`, largely due to threading, though overall steps are generally faster.
 
 ## Regenerating these tables
 
