@@ -244,17 +244,17 @@ Prior data also suggested a small improvement for pooled samples using a higher 
 
 | Step | dada2-rs wall (s) | dada2-rs cores | dada2-rs peak (MB) | R wall (s) | Speedup |
 |---|---:|---:|---:|---:|---:|
-| filter | 11.2 | 20.6 | 21 | 31.1 | 2.8× |
-| learn_fwd | 19.0 | 21.5 | 635 | 80.8 | 4.3× |
-| learn_rev | 22.4 | 21.0 | 769 | 107.6 | 4.8× |
-| dada_fwd | 22.2 | 19.9 | 573 | 196.4 | 8.8× |
-| dada_rev | 14.8 | 19.0 | 467 | 155.5 | 10.5× |
-| merge | 3.4 | 15.5 | 1554 | 198.5 | 59.1× |
+| filter | 11.2 | 20.6 | 21 | 31.1 | **2.8×** |
+| learn_fwd | 19.0 | 21.5 | 635 | 80.8 | **4.3×** |
+| learn_rev | 22.4 | 21.0 | 769 | 107.6 | **4.8×** |
+| dada_fwd | 22.2 | 19.9 | 573 | 196.4 | **8.8×** |
+| dada_rev | 14.8 | 19.0 | 467 | 155.5 | **10.5×** |
+| merge | 3.4 | 15.5 | 1554 | 198.5 | **59.1×** |
 | make_table | 0.1 | 1.0 | 62 | 0.1 | 1.0× |
 | remove_bimera | 0.1 | 17.8 | 21 | 0.1 | 0.8× |
-| TOTAL | 93.2 | 20.2 | 1554 | 791.3 | 8.5× |
+| TOTAL | 93.2 | 20.2 | 1554 | 791.3 | **8.5×** |
 
-Notably the big improvement is with `merge-pairs`, largely due to threading, though overall steps are generally faster.
+Notably the big improvement is with `merge-pairs`, largely due to threading, though overall steps are generally faster.  One interesting point: the full pooling run suggests that the two `dada` steps are not fully utilizing all cores, which may be a further point to assess. 
 
 ## Regenerating these tables
 
