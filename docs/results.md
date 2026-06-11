@@ -162,25 +162,41 @@ Two cross-stack notes:
 See [issue #22](https://github.com/HPCBio/dada2-rs/issues/22) for the keep-but-default-off
 decision.
 
-### Pre/post-update A/B (memory + speed work)
+### Pre/post A/B: dropping the resident 16-bit k-mer vector ([#32](https://github.com/HPCBio/dada2-rs/issues/32))
 
-A dada2-rs-vs-itself regression check (PacBio, node-exclusive, no cache flag).
+A dada2-rs-vs-itself check isolating the [#32](https://github.com/HPCBio/dada2-rs/issues/32)
+change (PR #34): **`pre`** is `main` immediately before it, **`post`** drops the
+resident `4^k` u16 k-mer frequency vector from each `Raw` (recomputed only on the
+near-never `kmer_dist8` overflow). Full 93-sample PacBio dataset, node-exclusive,
+no R. **Output is byte-identical** — `compare_asvs.py` pre-vs-post on the final
+chimera-filtered table: 2082 ASVs vs 2082, churn 0.
 
-**`pre`** is `main` before recent memory/speed improvements, **`post`** is current `main`. This spans the whole update window — a *composite* of the memory-representation change (#23, `qual_sum:[u32]` deferred division) and the `learn-errors`/`dada` speedups (issue #3 checklist: skip per-iteration setup, parallel `build_trans_mat`, SIMD `kmer_dist8`), not an isolated change. **R is not a variable here, so no R numbers apply.** 
+Only the `dada` step moves materially (`remove_primers` runs on identical inputs;
+`learn` sheds the same per-`Raw` vector and so also drops ~−35%):
 
-All rows are the same PacBio dataset, varying mode and k. `learn` wall falls ~−13 to −15% in every row below; the `dada` step is broken out:
+| mode | k | dada peak (pre → post) | peak Δ | dada wall Δ | dada cores Δ |
+|---|---|---|---:|---:|---:|
+| pooled (`--pool true`) | 5 | 28.72 → 27.59 GB | −3.9% | −0.2% (flat) | flat |
+| pooled (`--pool true`) | 7 | 52.33 → 35.69 GB | **−31.8%** | **−5.6%** | +3.4% |
+| pseudo cached (`--cache-samples`) | 7 | 14.29 → 10.27 GB | **−28.1%** | **−4.5%** | +2.7% |
 
-| mode | k | dada wall Δ | dada CPU Δ | dada peak (pre → post) | peak Δ |
-|---|---|---:|---:|---:|---:|
-| pooled (`--pool true`) | 5 | **−14.9%** | −15.5% | 36.14 → 28.61 GB | **−20.8%** |
-| pooled (`--pool true`) | 7 | **−14.4%** | −15.2% | 36.04 → 28.69 GB | **−20.4%** |
-| pseudo (streaming default) | 5 | **−14.9%** | −15.1% | 6.00 → 6.30 GB | +4.9% |
-| pseudo (cached, `--cache-samples`) | 7 | **−16.8%** | −17.4% | 18.27 → 13.12 GB | **−28.2%** |
+**The memory win scales with `4^k`.** The dropped vector is `4^k × 2` bytes/unique
+— 2 KB at k5, 32 KB at k7. Pooled sheds −1.1 GB at k5 vs −16.6 GB at k7, a 14.7×
+ratio ≈ the theoretical 16×, so the reduction is provably exactly the removed
+vector and nothing else. The `4^k` k-mer arrays are the dominant resident term in
+the all-samples modes — pooled `dada` is strongly k-related (k7 ~52 GB vs k5 ~29
+GB), not k-independent.
 
-**Verdict:** the **speed win is mode-independent**
-— `dada` wall and CPU fall together (~−15 to −17%) at flat cores (−0.3 to −1.0%) in every mode, i.e. genuinely less work, not better parallel packing. 
-- The **memory win is resident-bound**: the modes that hold all samples resident shed a large fraction of the high-water mark (pooled −20%, ~7.5 GB; cached −28%, ~5.2 GB), while the streaming pseudo path keeps only a small working set, so there is no RSS reduction to capture (a small ~300 MB uptick, single rep — read as flat, not a regression). 
-- The peak ordering tracks residency exactly — pooled 36 GB > cached 18 GB > streaming 6 GB. Pooled `dada` peak is ~36 GB at both k values: at that scale the resident all-samples data dominates RSS, the 4^k screen array is washed out, and the memory delta is representation-driven, not k-related.
+**The wall bonus is memory-bandwidth relief**, and it appears only where the
+resident set was large enough to saturate bandwidth. At k7, pooled and cached had
+depressed cores (18.2, 19.8) that recover (+3.4%, +2.7%) once ~16 GB / ~4 GB of
+k-mer data is shed, cutting `dada` wall −5.6% / −4.5%. At k5 pooled, cores were
+already 22.8/24 (below the bandwidth ceiling) and the wall is flat — nothing to
+recover. The win improving *only* where cores were depressed (not where they were
+saturated) rules out a build-time CPU saving, which would show flat at both k.
+This partially addresses [#33](https://github.com/HPCBio/dada2-rs/issues/33).
+Streaming pseudo is not shown: its small per-sample working set holds little
+resident k-mer data, so there is no u16 term to shed (≈flat).
 
 ## Illumina MiSeq (F1000, 384 samples)
 
