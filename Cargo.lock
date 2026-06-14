@@ -230,6 +230,7 @@ version = "0.1.1"
 dependencies = [
  "clap",
  "flate2",
+ "libc",
  "md-5",
  "noodles",
  "rand",

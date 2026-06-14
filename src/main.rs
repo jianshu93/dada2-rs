@@ -878,6 +878,12 @@ fn main() -> io::Result<()> {
             }
             let dereps: Vec<derep::Derep> = dereps.into_iter().map(|d| d.unwrap()).collect();
             let t_derep = t_derep.elapsed();
+            if verbose {
+                eprintln!(
+                    "[dada-pooled] peak RSS after derep: {} MB",
+                    misc::peak_rss_kb() / 1024
+                );
+            }
 
             // Resolve sample names: CLI override > JSON-embedded > filename stem.
             let sample_names: Vec<String> = match sample_names {
@@ -1013,11 +1019,23 @@ fn main() -> io::Result<()> {
 
             // ---- Run DADA once on the merged table ----
             let t_merge = t_merge.elapsed();
+            if verbose {
+                eprintln!(
+                    "[dada-pooled] peak RSS after merge: {} MB",
+                    misc::peak_rss_kb() / 1024
+                );
+            }
             let t_dada = std::time::Instant::now();
             let result = pool
                 .install(|| dada::dada_uniques(&raw_inputs, &dada_params))
                 .map_err(io::Error::other)?;
             let t_dada = t_dada.elapsed();
+            if verbose {
+                eprintln!(
+                    "[dada-pooled] peak RSS after dada: {} MB",
+                    misc::peak_rss_kb() / 1024
+                );
+            }
 
             if verbose {
                 eprintln!(

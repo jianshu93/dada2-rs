@@ -78,6 +78,27 @@ fn read_all_maybe_gz(path: &Path) -> io::Result<Vec<u8>> {
     }
 }
 
+/// Process peak resident-set size (high-water mark) in kibibytes, via
+/// `getrusage(RUSAGE_SELF).ru_maxrss`.
+///
+/// `ru_maxrss` is monotonic (a high-water mark, never decreasing), so logging it
+/// at successive phase boundaries reveals *which phase* drove the peak: the phase
+/// after which it jumps owns that memory. Linux reports `ru_maxrss` in kB; macOS
+/// in bytes — normalized to kB here, matching the benchmark harness.
+pub fn peak_rss_kb() -> u64 {
+    // SAFETY: getrusage with a zeroed rusage out-param is always sound.
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) } != 0 {
+        return 0;
+    }
+    let maxrss = ru.ru_maxrss as u64;
+    if cfg!(target_os = "macos") {
+        maxrss / 1024 // bytes -> kB
+    } else {
+        maxrss // already kB on Linux
+    }
+}
+
 /// Format a path for use in error messages.  `-` becomes `<stdin>`.
 fn display_input(path: &Path) -> String {
     if is_stdin(path) {
