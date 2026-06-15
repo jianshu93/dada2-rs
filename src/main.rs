@@ -899,7 +899,12 @@ fn main() -> io::Result<()> {
             let t_merge = std::time::Instant::now();
             let mut seq_to_merged: HashMap<Vec<u8>, usize> = HashMap::new();
             let mut merged_seqs: Vec<Vec<u8>> = Vec::new();
-            let mut merged_qual_sum: Vec<Vec<f64>> = Vec::new();
+            // Per-position Phred SUM across samples, kept as integers (issue #39):
+            // per-sample Derep.quals are already u32 sums (#23), so the merge just
+            // adds them — u32 instead of f64 halves this accumulator (the largest
+            // merge intermediate). checked_add guards the (astronomically
+            // unlikely) overflow rather than silently wrapping.
+            let mut merged_qual_sum: Vec<Vec<u32>> = Vec::new();
             let mut merged_total: Vec<u32> = Vec::new();
             let mut local_to_merged: Vec<Vec<usize>> = Vec::with_capacity(n_samples);
 
@@ -913,7 +918,11 @@ fn main() -> io::Result<()> {
                             // `qual` is already this unique's per-position Phred
                             // sum; accumulate sums across samples.
                             for (p, &q) in qual.iter().enumerate() {
-                                merged_qual_sum[i][p] += q as f64;
+                                merged_qual_sum[i][p] =
+                                    merged_qual_sum[i][p].checked_add(q).expect(
+                                        "merged per-position Phred sum overflows u32 \
+                                             (pooled depth extreme); widen merged_qual_sum to u64",
+                                    );
                             }
                             i
                         }
@@ -921,7 +930,7 @@ fn main() -> io::Result<()> {
                             let i = merged_seqs.len();
                             seq_to_merged.insert(seq.clone(), i);
                             merged_seqs.push(seq.clone());
-                            merged_qual_sum.push(qual.iter().map(|&q| q as f64).collect());
+                            merged_qual_sum.push(qual.clone());
                             merged_total.push(count_u32);
                             i
                         }
@@ -941,6 +950,7 @@ fn main() -> io::Result<()> {
                 .map(|d| d.uniques.iter().map(|(_, c)| *c as u32).collect())
                 .collect();
             drop(dereps);
+            drop(seq_to_merged); // only used inside the merge loop; dead now
 
             let n_merged = merged_seqs.len();
             if verbose {
@@ -953,19 +963,22 @@ fn main() -> io::Result<()> {
             }
 
             // ---- Build merged RawInput list ----
-            let mut raw_inputs: Vec<dada::RawInput> = (0..n_merged)
-                .map(|i| {
-                    let sequence: String = String::from_utf8(merged_seqs[i].clone())
+            // Consume the merge vecs (move, don't clone): each merged sequence
+            // and its u32 qual-sum row are moved straight into a RawInput, so the
+            // merge intermediates are freed as raw_inputs is built rather than
+            // sitting resident through the dada call (issue #39). quals are
+            // already u32 sums — no conversion.
+            let mut raw_inputs: Vec<dada::RawInput> = merged_seqs
+                .into_iter()
+                .zip(merged_qual_sum)
+                .zip(merged_total)
+                .map(|((seq_bytes, quals), abundance)| {
+                    let sequence: String = String::from_utf8(seq_bytes)
                         .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
                     dada::RawInput {
-                        quals: Some(
-                            merged_qual_sum[i]
-                                .iter()
-                                .map(|&s| derep::checked_qual_sum(s))
-                                .collect(),
-                        ),
+                        quals: Some(quals),
                         seq: sequence,
-                        abundance: merged_total[i],
+                        abundance,
                         prior: false,
                     }
                 })
@@ -977,14 +990,6 @@ fn main() -> io::Result<()> {
                     "All input FASTQ files contain no reads",
                 ));
             }
-
-            // Merge intermediates are now fully captured in `raw_inputs`; drop
-            // them before denoising so they don't sit resident through the dada
-            // call (issue #39). `merged_qual_sum` (f64) is the largest.
-            drop(merged_qual_sum);
-            drop(merged_seqs);
-            drop(seq_to_merged);
-            drop(merged_total);
 
             // ---- Mark prior sequences ----
             if let Some(ref prior_path) = prior {
