@@ -25,6 +25,32 @@ impl ComplexityConfig {
     }
 }
 
+/// Per-position EE histogram is binned on a log10 scale over
+/// `[10^EE_LOG_MIN, 10^EE_LOG_MAX]`. EE below the low edge clamps to bin 0,
+/// above the high edge to the last bin. The range comfortably brackets the
+/// standard maxEE cutoffs (2/3/5/7) with fine low-end resolution.
+const EE_LOG_MIN: f64 = -4.0;
+const EE_LOG_MAX: f64 = 3.0;
+
+/// Configuration for the optional per-position expected-error (EE) metrics. EE
+/// at a position is the read's *cumulative* expected error up to that base:
+/// `Σ 10^(-Q_i/10)` for `i ≤ pos` — the same quantity `filter-and-trim`
+/// thresholds against `maxEE`. We aggregate the per-read cumulative EE across
+/// reads at each position: exact mean/min/max, plus quantiles from a per-position
+/// log-binned histogram.
+#[derive(Clone, Copy)]
+pub struct ExpectedErrorConfig {
+    pub bins: usize,
+}
+
+/// What extra per-read metrics `summary` should compute, beyond the per-position
+/// quality aggregates it always produces.
+#[derive(Clone, Copy, Default)]
+pub struct SummaryConfig {
+    pub complexity: Option<ComplexityConfig>,
+    pub expected_error: Option<ExpectedErrorConfig>,
+}
+
 /// Effective number of k-mers in `seq` = `exp(-Σ p·ln p)` over the read's
 /// overlapping k-mer counts. K-mers containing non-ACGT bases are skipped
 /// (matching Biostrings `oligonucleotideFrequency`, which ignores ambiguous
@@ -77,11 +103,20 @@ pub struct QualitySummary {
     /// `complexity_hist[bin]` = number of reads whose effective k-mer count falls
     /// in `bin` (equal-width bins over `[0, 4^kmer_size]`). Empty when disabled.
     complexity_hist: Vec<u64>,
+    /// Optional per-position cumulative-EE metrics. `None` unless requested.
+    expected_error: Option<ExpectedErrorConfig>,
+    /// Per-position accumulators over per-read cumulative EE. Empty when disabled.
+    ee_sum: Vec<f64>,
+    ee_min: Vec<f64>,
+    ee_max: Vec<f64>,
+    /// `ee_hist[pos][bin]` = reads whose cumulative EE at `pos` falls in log-bin
+    /// `bin` (see `EE_LOG_MIN`/`EE_LOG_MAX`). Used for per-position quantiles.
+    ee_hist: Vec<Vec<u64>>,
 }
 
 impl QualitySummary {
-    pub fn with_complexity(complexity: Option<ComplexityConfig>) -> Self {
-        let complexity_hist = match complexity {
+    pub fn with_config(config: SummaryConfig) -> Self {
+        let complexity_hist = match config.complexity {
             Some(cfg) => vec![0; cfg.bins],
             None => Vec::new(),
         };
@@ -90,9 +125,29 @@ impl QualitySummary {
             sums: Vec::new(),
             counts: Vec::new(),
             hist: Vec::new(),
-            complexity,
+            complexity: config.complexity,
             complexity_hist,
+            expected_error: config.expected_error,
+            ee_sum: Vec::new(),
+            ee_min: Vec::new(),
+            ee_max: Vec::new(),
+            ee_hist: Vec::new(),
         }
+    }
+
+    /// Log-bin index for a cumulative EE value, clamped to `[0, bins)`.
+    fn ee_bin(ee: f64, bins: usize) -> usize {
+        if ee <= 0.0 {
+            return 0;
+        }
+        let frac = (ee.log10() - EE_LOG_MIN) / (EE_LOG_MAX - EE_LOG_MIN);
+        ((frac * bins as f64).floor() as isize).clamp(0, bins as isize - 1) as usize
+    }
+
+    /// Representative EE value at the center of log-bin `bin`.
+    fn ee_bin_center(bin: usize, bins: usize) -> f64 {
+        let log = EE_LOG_MIN + (bin as f64 + 0.5) / bins as f64 * (EE_LOG_MAX - EE_LOG_MIN);
+        10f64.powf(log)
     }
 
     fn add_record(&mut self, sequence: &[u8], quality: &[u8], phred_offset: u8) {
@@ -113,6 +168,29 @@ impl QualitySummary {
             let frac = si / cfg.max_complexity();
             let bin = ((frac * cfg.bins as f64) as usize).min(cfg.bins - 1);
             self.complexity_hist[bin] += 1;
+        }
+        if let Some(cfg) = self.expected_error {
+            let n = quality.len();
+            if n > self.ee_sum.len() {
+                self.ee_sum.resize(n, 0.0);
+                self.ee_min.resize(n, f64::INFINITY);
+                self.ee_max.resize(n, 0.0);
+                self.ee_hist.resize(n, vec![0; cfg.bins]);
+            }
+            // Cumulative expected error: Σ 10^(-Q/10) up to and including pos.
+            let mut ee = 0.0;
+            for (i, &q) in quality.iter().enumerate() {
+                let q_phred = ((q as i16) - (phred_offset as i16)).max(0) as f64;
+                ee += 10f64.powf(-q_phred / 10.0);
+                self.ee_sum[i] += ee;
+                if ee < self.ee_min[i] {
+                    self.ee_min[i] = ee;
+                }
+                if ee > self.ee_max[i] {
+                    self.ee_max[i] = ee;
+                }
+                self.ee_hist[i][Self::ee_bin(ee, cfg.bins)] += 1;
+            }
         }
         self.total_reads += 1;
     }
@@ -139,6 +217,34 @@ impl QualitySummary {
         }
         if self.complexity.is_none() {
             self.complexity = other.complexity;
+        }
+        // Expected-error accumulators.
+        let ee_len = self.ee_sum.len().max(other.ee_sum.len());
+        if ee_len > 0 {
+            let bins = self
+                .expected_error
+                .or(other.expected_error)
+                .map(|c| c.bins)
+                .unwrap_or(0);
+            self.ee_sum.resize(ee_len, 0.0);
+            self.ee_min.resize(ee_len, f64::INFINITY);
+            self.ee_max.resize(ee_len, 0.0);
+            self.ee_hist.resize(ee_len, vec![0; bins]);
+            for i in 0..other.ee_sum.len() {
+                self.ee_sum[i] += other.ee_sum[i];
+                if other.ee_min[i] < self.ee_min[i] {
+                    self.ee_min[i] = other.ee_min[i];
+                }
+                if other.ee_max[i] > self.ee_max[i] {
+                    self.ee_max[i] = other.ee_max[i];
+                }
+                for (b, &n) in other.ee_hist[i].iter().enumerate() {
+                    self.ee_hist[i][b] += n;
+                }
+            }
+        }
+        if self.expected_error.is_none() {
+            self.expected_error = other.expected_error;
         }
         self.total_reads += other.total_reads;
         self
@@ -179,6 +285,70 @@ impl QualitySummary {
         self.complexity
             .map(|cfg| (cfg.kmer_size, cfg.bins, self.complexity_hist.as_slice()))
     }
+
+    /// Per-position cumulative expected-error metrics, if requested. Each vector
+    /// is indexed by zero-based position. `mean`/`min`/`max` are exact; the
+    /// quantiles (`q25`, `median`, `q75`) are read off the per-position log-binned
+    /// histogram (bin-center resolution).
+    pub fn expected_error_metrics(&self) -> Option<ExpectedErrorMetrics> {
+        let cfg = self.expected_error?;
+        let npos = self.ee_sum.len();
+        let mut mean = vec![0.0; npos];
+        let mut min = vec![0.0; npos];
+        let mut max = vec![0.0; npos];
+        let mut q25 = vec![0.0; npos];
+        let mut median = vec![0.0; npos];
+        let mut q75 = vec![0.0; npos];
+        for i in 0..npos {
+            let count = self.counts[i];
+            if count == 0 {
+                continue;
+            }
+            mean[i] = self.ee_sum[i] / count as f64;
+            min[i] = self.ee_min[i];
+            max[i] = self.ee_max[i];
+            q25[i] = self.ee_quantile(i, 0.25, cfg.bins);
+            median[i] = self.ee_quantile(i, 0.50, cfg.bins);
+            q75[i] = self.ee_quantile(i, 0.75, cfg.bins);
+        }
+        Some(ExpectedErrorMetrics {
+            mean,
+            min,
+            max,
+            q25,
+            median,
+            q75,
+        })
+    }
+
+    /// Quantile `q` of the cumulative-EE distribution at position `i`, taken from
+    /// the log-binned histogram (returns the center EE of the crossing bin).
+    fn ee_quantile(&self, i: usize, q: f64, bins: usize) -> f64 {
+        let row = &self.ee_hist[i];
+        let total: u64 = row.iter().sum();
+        if total == 0 {
+            return 0.0;
+        }
+        let target = q * total as f64;
+        let mut cum = 0u64;
+        for (bin, &n) in row.iter().enumerate() {
+            cum += n;
+            if cum as f64 >= target {
+                return Self::ee_bin_center(bin, bins);
+            }
+        }
+        Self::ee_bin_center(bins - 1, bins)
+    }
+}
+
+/// Per-position cumulative expected-error metrics (see `expected_error_metrics`).
+pub struct ExpectedErrorMetrics {
+    pub mean: Vec<f64>,
+    pub min: Vec<f64>,
+    pub max: Vec<f64>,
+    pub q25: Vec<f64>,
+    pub median: Vec<f64>,
+    pub q75: Vec<f64>,
 }
 
 /// Records per thread per chunk — total chunk size scales with thread count.
@@ -188,16 +358,16 @@ pub fn process<R: io::Read>(
     reader: R,
     phred_offset: u8,
     pool: &rayon::ThreadPool,
-    complexity: Option<ComplexityConfig>,
+    config: SummaryConfig,
 ) -> io::Result<QualitySummary> {
     let chunk_size = RECORDS_PER_THREAD * pool.current_num_threads();
     let buf = BufReader::new(reader);
     let mut fastq_reader = fastq::io::Reader::new(buf);
-    let mut overall = QualitySummary::with_complexity(complexity);
+    let mut overall = QualitySummary::with_config(config);
 
     // Only retain the sequence when complexity is requested — otherwise it's
     // dead weight in the chunk buffer.
-    let want_seq = complexity.is_some();
+    let want_seq = config.complexity.is_some();
 
     loop {
         // Read a chunk sequentially — the reader is a stream and cannot be shared.
@@ -237,14 +407,14 @@ pub fn process<R: io::Read>(
             chunk
                 .par_iter()
                 .fold(
-                    || QualitySummary::with_complexity(complexity),
+                    || QualitySummary::with_config(config),
                     |mut acc, (sequence, quality)| {
                         acc.add_record(sequence, quality, phred_offset);
                         acc
                     },
                 )
                 .reduce(
-                    || QualitySummary::with_complexity(complexity),
+                    || QualitySummary::with_config(config),
                     QualitySummary::merge,
                 )
         });
@@ -257,4 +427,43 @@ pub fn process<R: io::Read>(
     }
 
     Ok(overall)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Phred+33: 'I' = Q40 (err 1e-4), '+' = Q10 (err 0.1).
+    #[test]
+    fn cumulative_ee_is_running_sum_of_per_base_error() {
+        let cfg = SummaryConfig {
+            complexity: None,
+            expected_error: Some(ExpectedErrorConfig { bins: 200 }),
+        };
+        let mut s = QualitySummary::with_config(cfg);
+        // Two reads so mean/min/max differ from any single read.
+        s.add_record(b"ACGT", b"IIII", 33); // EE each base 1e-4
+        s.add_record(b"ACGT", b"++++", 33); // EE each base 1e-1
+        let m = s.expected_error_metrics().unwrap();
+        // Position 0: per-base EE only.
+        assert!((m.min[0] - 1e-4).abs() < 1e-12);
+        assert!((m.max[0] - 1e-1).abs() < 1e-12);
+        // Mean of cumulative EE at last position = mean of the two read totals.
+        let expected_mean = (4.0 * 1e-4 + 4.0 * 1e-1) / 2.0;
+        assert!((m.mean[3] - expected_mean).abs() < 1e-12);
+        // Cumulative is monotonic non-decreasing within the max curve.
+        assert!(m.max[3] >= m.max[0]);
+        assert!((m.max[3] - 0.4).abs() < 1e-12);
+    }
+
+    #[test]
+    fn complexity_of_a_homopolymer_is_one() {
+        // A single 2-mer ("AA") repeated -> one distinct k-mer -> exp(0) = 1.
+        assert!((seq_complexity(b"AAAAAA", 2) - 1.0).abs() < 1e-12);
+        // Equal counts of all four bases' 2-mers approach higher diversity.
+        assert!(seq_complexity(b"ACGTACGTACGT", 2) > 3.0);
+        // Read shorter than k, or all-N, falls back to 1.0 (matches R sindex).
+        assert_eq!(seq_complexity(b"A", 2), 1.0);
+        assert_eq!(seq_complexity(b"NNNN", 2), 1.0);
+    }
 }

@@ -68,6 +68,18 @@ pub enum Commands {
         /// (DADA2 `plotComplexity` default 100). Only used with `--complexity`.
         #[arg(long, default_value_t = 100)]
         complexity_bins: usize,
+
+        /// Also compute per-position cumulative expected-error (EE) metrics:
+        /// `Σ 10^(-Q/10)` along each read, aggregated across reads into
+        /// mean/median/min/max/quartiles per position. Useful for judging
+        /// `filter-and-trim` `maxEE`/truncation choices.
+        #[arg(long)]
+        expected_error: bool,
+
+        /// Number of log-spaced histogram bins backing the EE quantiles. Only
+        /// used when `--expected-error` is set.
+        #[arg(long, default_value_t = 200)]
+        ee_bins: usize,
     },
 
     /// Dereplicate sequences from a FASTQ file

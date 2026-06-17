@@ -47,7 +47,7 @@ use remove_bimera::{BimeraParams, Method, remove_bimera_denovo};
 use remove_primers::{RemovePrimersParams, iupac_reverse_complement, remove_primers};
 use sequence_table::{HashAlgo, OrderBy, SequenceTable, make_sequence_table};
 use serde::Serialize;
-use summary::{ComplexityConfig, process};
+use summary::{ComplexityConfig, ExpectedErrorConfig, SummaryConfig, process};
 use taxonomy::{
     SpeciesHit, SpeciesOptions, SpeciesRef, TaxonomyOptions, TaxonomyRef, assign_species,
     assign_taxonomy,
@@ -198,30 +198,35 @@ fn main() -> io::Result<()> {
             complexity,
             complexity_kmer_size,
             complexity_bins,
+            expected_error,
+            ee_bins,
         } => {
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(threads)
                 .build()
                 .map_err(io::Error::other)?;
 
-            let complexity_cfg = complexity.then_some(ComplexityConfig {
-                kmer_size: complexity_kmer_size,
-                bins: complexity_bins,
-            });
+            let summary_cfg = SummaryConfig {
+                complexity: complexity.then_some(ComplexityConfig {
+                    kmer_size: complexity_kmer_size,
+                    bins: complexity_bins,
+                }),
+                expected_error: expected_error.then_some(ExpectedErrorConfig { bins: ee_bins }),
+            };
 
             let summary = if input.extension().and_then(|e| e.to_str()) == Some("gz") {
                 process(
                     MultiGzDecoder::new(File::open(&input).with_path(&input)?),
                     phred_offset,
                     &pool,
-                    complexity_cfg,
+                    summary_cfg,
                 )?
             } else {
                 process(
                     File::open(&input).with_path(&input)?,
                     phred_offset,
                     &pool,
-                    complexity_cfg,
+                    summary_cfg,
                 )?
             };
 
@@ -233,6 +238,19 @@ fn main() -> io::Result<()> {
                 kmer_size: u8,
                 bins: usize,
                 histogram: Vec<u64>,
+            }
+
+            /// Per-position cumulative expected error aggregated across reads.
+            /// Each array is indexed by zero-based position; `mean`/`min`/`max`
+            /// are exact, the quantiles come from a log-binned histogram.
+            #[derive(Serialize)]
+            struct ExpectedErrorOutput {
+                mean: Vec<f64>,
+                min: Vec<f64>,
+                q25: Vec<f64>,
+                median: Vec<f64>,
+                q75: Vec<f64>,
+                max: Vec<f64>,
             }
 
             #[derive(Serialize)]
@@ -249,6 +267,10 @@ fn main() -> io::Result<()> {
                 /// `--complexity` was requested.
                 #[serde(skip_serializing_if = "Option::is_none")]
                 complexity: Option<ComplexityOutput>,
+                /// Per-position cumulative expected error; present only when
+                /// `--expected-error` was requested.
+                #[serde(skip_serializing_if = "Option::is_none")]
+                expected_error: Option<ExpectedErrorOutput>,
             }
 
             let sample = sample_name.unwrap_or_else(|| fastq_stem(&input));
@@ -260,6 +282,17 @@ fn main() -> io::Result<()> {
                     bins,
                     histogram: hist.to_vec(),
                 });
+            let expected_error_out =
+                summary
+                    .expected_error_metrics()
+                    .map(|m| ExpectedErrorOutput {
+                        mean: m.mean,
+                        min: m.min,
+                        q25: m.q25,
+                        median: m.median,
+                        q75: m.q75,
+                        max: m.max,
+                    });
             let out = SummaryOutput {
                 sample,
                 total_reads: summary.total_reads,
@@ -268,6 +301,7 @@ fn main() -> io::Result<()> {
                 max_quality,
                 quality_histogram,
                 complexity: complexity_out,
+                expected_error: expected_error_out,
             };
 
             let tagged = Tagged::new("summary", out);
