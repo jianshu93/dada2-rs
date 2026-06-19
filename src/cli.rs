@@ -1238,9 +1238,25 @@ pub enum Commands {
         #[arg(long)]
         wfa_max_edits: Option<i32>,
 
-        /// Minimum single-junction coverage fraction to flag a trimera suspect
-        #[arg(long, default_value_t = 0.9)]
-        trimera_min_cover_frac: f64,
+        /// Minimum distance to the nearest single parent to flag a trimera
+        /// suspect. Rejects few-SNP variants of one abundant parent, which leave
+        /// a coverage gap but are not chimeras.
+        #[arg(long, default_value_t = 15)]
+        trimera_min_parent_dist: usize,
+
+        /// Minimum residual gap length (bp) for a credible third segment.
+        /// Rejects one-off bimeras (gap of ~1 base).
+        #[arg(long, default_value_t = 20)]
+        trimera_min_gap: usize,
+
+        /// Maximum third-parent mismatch fraction across the gap (clean fit)
+        #[arg(long, default_value_t = 0.10)]
+        trimera_max_gap_error: f64,
+
+        /// Minimum length (bp) of each end flank. A 3-segment mosaic needs two
+        /// substantial flanks; rejects tiny-flank divergent singletons.
+        #[arg(long, default_value_t = 30)]
+        trimera_min_flank: usize,
 
         /// Number of threads for parallel diagnostics
         #[arg(long, default_value_t = 1)]

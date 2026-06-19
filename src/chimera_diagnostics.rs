@@ -36,19 +36,54 @@ pub struct DiagnosticRow<'a> {
     pub best_right_parent: Option<&'a str>,
     pub third_parent: Option<&'a str>,
     pub gap_mismatches: usize,
-    /// Heuristic screen: survived the strict bimera test but a single junction
-    /// covers at least `min_cover_frac` of the read, leaving a real gap.
+    /// Mismatches the better *end* parent leaves across the gap (`usize::MAX` =
+    /// not computed). The baseline a third parent must beat.
+    pub gap_end_parent_mismatches: usize,
+    /// Ends-free Hamming distance to the nearest single parent (`usize::MAX` =
+    /// no candidate parent). Small = few-SNP variant; large = mosaic.
+    pub nearest_parent_dist: usize,
+    /// Refined screen (see [`TrimeraCriteria`]): the read is not a bimera, is
+    /// far from any single parent, and a distinct third parent explains a
+    /// non-trivial gap better than either end parent.
     pub trimera_suspect: bool,
+}
+
+/// Thresholds for the `trimera_suspect` call. Defaults are tuned on ~600 bp nodA
+/// amplicons; see CLI `--trimera-*` flags.
+#[derive(Clone, Copy, Debug)]
+pub struct TrimeraCriteria {
+    /// Minimum distance to the nearest single parent — rejects few-SNP variants.
+    pub min_parent_dist: usize,
+    /// Minimum gap length for a credible third segment — rejects one-off bimeras.
+    pub min_gap_len: usize,
+    /// Maximum third-parent mismatch fraction across the gap (clean fit).
+    pub max_gap_error_frac: f64,
+    /// Minimum length of *each* end flank (`max_left` and `max_right`). A
+    /// 3-segment mosaic needs two real junctions, hence two substantial flanks;
+    /// this rejects tiny-flank divergent singletons whose "gap" is nearly the
+    /// whole read.
+    pub min_flank: usize,
+}
+
+impl Default for TrimeraCriteria {
+    fn default() -> Self {
+        Self {
+            min_parent_dist: 15,
+            min_gap_len: 20,
+            max_gap_error_frac: 0.10,
+            min_flank: 30,
+        }
+    }
 }
 
 /// Run the pooled bimera coverage diagnostic over `table`.
 ///
-/// `min_cover_frac` sets the `trimera_suspect` threshold on `cover / length`.
-/// Returns one [`DiagnosticRow`] per sequence, in table column order.
+/// `crit` sets the `trimera_suspect` thresholds. Returns one [`DiagnosticRow`]
+/// per sequence, in table column order.
 pub fn run_diagnostics<'a>(
     table: &'a SequenceTable,
     params: &BimeraParams,
-    min_cover_frac: f64,
+    crit: TrimeraCriteria,
 ) -> Vec<DiagnosticRow<'a>> {
     let ncol = table.sequences.len();
     let nrow = table.samples.len();
@@ -97,7 +132,25 @@ pub fn run_diagnostics<'a>(
                 0.0
             };
             let gap_len = d.gap_end.saturating_sub(d.gap_start);
-            let trimera_suspect = !d.is_bimera && gap_len > 0 && cover_frac >= min_cover_frac;
+            // Refined trimera screen. A genuine higher-order chimera: (1) is not
+            // a bimera, (2) sits far from every single parent (not a SNP
+            // variant), (3) has a non-trivial gap, (4) has a distinct third
+            // parent that fills the gap cleanly AND strictly better than either
+            // end parent does (else the gap is just variation an end parent
+            // already explains).
+            let gap_err_frac = if gap_len > 0 {
+                d.gap_mismatches as f64 / gap_len as f64
+            } else {
+                1.0
+            };
+            let trimera_suspect = !d.is_bimera
+                && d.nearest_parent_dist >= crit.min_parent_dist
+                && d.max_left >= crit.min_flank
+                && d.max_right >= crit.min_flank
+                && gap_len >= crit.min_gap_len
+                && d.third_parent.is_some()
+                && gap_err_frac <= crit.max_gap_error_frac
+                && d.gap_mismatches < d.gap_end_parent_mismatches;
             DiagnosticRow {
                 sequence_id: table.sequence_ids[j].as_str(),
                 length: d.sqlen,
@@ -115,6 +168,8 @@ pub fn run_diagnostics<'a>(
                 best_right_parent: id(d.best_right_parent),
                 third_parent: id(d.third_parent),
                 gap_mismatches: d.gap_mismatches,
+                gap_end_parent_mismatches: d.gap_end_parent_mismatches,
+                nearest_parent_dist: d.nearest_parent_dist,
                 trimera_suspect,
             }
         })
@@ -123,7 +178,18 @@ pub fn run_diagnostics<'a>(
 
 const HEADER: &str = "sequence_id\tlength\ttotal_abundance\tn_samples\tis_bimera\t\
 max_left\tmax_right\tcover\tcover_frac\tgap_len\tgap_start\tgap_end\t\
-best_left_parent\tbest_right_parent\tthird_parent\tgap_mismatches\ttrimera_suspect";
+best_left_parent\tbest_right_parent\tthird_parent\tgap_mismatches\t\
+gap_end_parent_mismatches\tnearest_parent_dist\ttrimera_suspect";
+
+/// Format a `usize` count as a TSV cell, rendering the `usize::MAX` sentinel
+/// ("not computed") as `NA`.
+fn cell(v: usize) -> String {
+    if v == usize::MAX {
+        "NA".to_string()
+    } else {
+        v.to_string()
+    }
+}
 
 /// Write diagnostics rows as TSV (header + one row per sequence) to `w`.
 pub fn write_tsv<W: Write>(rows: &[DiagnosticRow<'_>], w: &mut W) -> io::Result<()> {
@@ -132,7 +198,7 @@ pub fn write_tsv<W: Write>(rows: &[DiagnosticRow<'_>], w: &mut W) -> io::Result<
     for r in rows {
         writeln!(
             w,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             r.sequence_id,
             r.length,
             r.total_abundance,
@@ -149,6 +215,8 @@ pub fn write_tsv<W: Write>(rows: &[DiagnosticRow<'_>], w: &mut W) -> io::Result<
             r.best_right_parent.unwrap_or(na),
             r.third_parent.unwrap_or(na),
             r.gap_mismatches,
+            cell(r.gap_end_parent_mismatches),
+            cell(r.nearest_parent_dist),
             r.trimera_suspect,
         )?;
     }

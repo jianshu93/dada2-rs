@@ -472,6 +472,18 @@ pub struct BimeraDiagnostic {
     /// large counts suggest the gap is novel biological sequence instead.
     pub third_parent: Option<usize>,
     pub gap_mismatches: usize,
+    /// Minimum ends-free Hamming distance to any single candidate parent. The
+    /// key disambiguator: a few-SNP *variant* of one abundant parent has a small
+    /// value here and is NOT a chimera, even though it leaves a coverage gap; a
+    /// genuine mosaic is close to no single parent (large value). See
+    /// [`get_ham_endsfree`]. `usize::MAX` when there are no candidate parents.
+    pub nearest_parent_dist: usize,
+    /// Fewest mismatches across the residual gap achieved by either *end* parent
+    /// (`best_left_parent` / `best_right_parent`). The baseline the third parent
+    /// must beat: if `gap_mismatches` is not meaningfully below this, the gap is
+    /// explained just as well by an end parent (i.e. a variant), not a third
+    /// source. `usize::MAX` when not computed (bimera / no parents).
+    pub gap_end_parent_mismatches: usize,
 }
 
 /// Count mismatches of parent `al_p` against query `al_q` across the query
@@ -552,6 +564,8 @@ pub fn pooled_diagnostics(
                 gap_end: sqlen,
                 third_parent: None,
                 gap_mismatches: 0,
+                nearest_parent_dist: usize::MAX,
+                gap_end_parent_mismatches: usize::MAX,
             };
 
             if abund == 0 {
@@ -566,10 +580,17 @@ pub fn pooled_diagnostics(
                 return d;
             }
 
-            // Pass 1: strict left/right coverage and the parents achieving it.
+            // Pass 1: strict left/right coverage, the parents achieving it, and
+            // the nearest single parent (ends-free Hamming) — the disambiguator
+            // between a few-SNP variant and a genuine mosaic.
+            let mut nearest = usize::MAX;
             for &k in &parents {
                 bimera_align(sq, seqs[k], &align_scores, backend, max_steps, buf);
                 let (al0, al1) = buf.alignment();
+                let dist = get_ham_endsfree(al0, al1);
+                if dist < nearest {
+                    nearest = dist;
+                }
                 let (left, right, _, _) = get_lr(al0, al1, false, max_shift as usize);
                 // Skip identity / pure-shift / internal-indel parents.
                 if left + right >= sqlen {
@@ -584,6 +605,7 @@ pub fn pooled_diagnostics(
                     d.best_right_parent = Some(k);
                 }
             }
+            d.nearest_parent_dist = nearest;
 
             d.is_bimera = d.max_left + d.max_right >= sqlen;
             if d.is_bimera {
@@ -592,24 +614,28 @@ pub fn pooled_diagnostics(
             d.gap_start = d.max_left.min(sqlen);
             d.gap_end = sqlen.saturating_sub(d.max_right).max(d.gap_start);
 
-            // Pass 2: third-parent fit across the residual gap. Exclude the two
-            // end parents so a hit is a genuinely distinct third source.
+            // Pass 2: score the residual gap. The two end parents give the
+            // baseline a third source must beat; the best non-end parent is the
+            // third-parent candidate.
             let mut best_mm = usize::MAX;
             let mut best_k = None;
+            let mut end_mm = usize::MAX;
             for &k in &parents {
-                if Some(k) == d.best_left_parent || Some(k) == d.best_right_parent {
-                    continue;
-                }
                 bimera_align(sq, seqs[k], &align_scores, backend, max_steps, buf);
                 let (al0, al1) = buf.alignment();
                 let mm = gap_mismatch_count(al0, al1, d.gap_start, d.gap_end);
-                if mm < best_mm {
+                if Some(k) == d.best_left_parent || Some(k) == d.best_right_parent {
+                    if mm < end_mm {
+                        end_mm = mm;
+                    }
+                } else if mm < best_mm {
                     best_mm = mm;
                     best_k = Some(k);
                 }
             }
             d.third_parent = best_k;
             d.gap_mismatches = if best_mm == usize::MAX { 0 } else { best_mm };
+            d.gap_end_parent_mismatches = end_mm;
             d
         })
         .collect()
@@ -683,6 +709,61 @@ mod tests {
             q.gap_mismatches <= 2,
             "third parent should fill the gap nearly cleanly, got {}",
             q.gap_mismatches
+        );
+        // A genuine mosaic is close to no single parent...
+        assert!(
+            q.nearest_parent_dist >= 20,
+            "mosaic should not be near any single parent, got {}",
+            q.nearest_parent_dist
+        );
+        // ...and the third parent must beat the end parents in the gap.
+        assert!(
+            q.gap_mismatches < q.gap_end_parent_mismatches,
+            "third parent ({}) must beat end parents ({}) in the gap",
+            q.gap_mismatches,
+            q.gap_end_parent_mismatches
+        );
+    }
+
+    /// A few-SNP variant of a single abundant parent leaves a coverage gap but
+    /// is NOT a chimera: it sits very close to one parent, and no third parent
+    /// explains the gap better than that parent does. (The confound found on the
+    /// real nodA data.)
+    #[test]
+    fn pooled_diagnostics_rejects_snp_variant() {
+        // 60 bp parent with low internal self-similarity.
+        let par_a: Vec<u8> =
+            b"ACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGT".to_vec();
+        assert_eq!(par_a.len(), 60);
+        // Query = par_a with 3 internal substitutions at 20, 30, 40.
+        let mut query = par_a.clone();
+        for &p in &[20usize, 30, 40] {
+            query[p] = if query[p] == b'A' { b'C' } else { b'A' };
+        }
+        let par_x: Vec<u8> =
+            b"TTTTTTTTTTGGGGGGGGGGCCCCCCCCCCAAAAAAAAAATTTTTTTTTTGGGGGGGGGG".to_vec();
+        let par_y: Vec<u8> =
+            b"GAGAGAGAGAGAGAGAGAGAGAGAGAGAGAGAGAGAGAGAGAGAGAGAGAGAGAGAGAGA".to_vec();
+
+        let seqs: Vec<&[u8]> = vec![&query, &par_a, &par_x, &par_y];
+        let pooled = vec![2u32, 100, 100, 100];
+
+        let d = pooled_diagnostics(&pooled, &seqs, 1.5, 2, &params());
+        let q = &d[0];
+
+        assert!(!q.is_bimera);
+        assert_eq!(
+            q.nearest_parent_dist, 3,
+            "variant is 3 SNPs from its single parent"
+        );
+        // The gap is explained at least as well by an end parent as by any
+        // third parent, so it must not pass a "third beats end" trimera gate.
+        assert!(
+            q.gap_mismatches >= q.gap_end_parent_mismatches,
+            "no third parent should beat the end parent for a SNP variant \
+             (third={}, end={})",
+            q.gap_mismatches,
+            q.gap_end_parent_mismatches
         );
     }
 

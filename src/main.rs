@@ -2174,7 +2174,10 @@ fn main() -> io::Result<()> {
             gap_p,
             align_backend,
             wfa_max_edits,
-            trimera_min_cover_frac,
+            trimera_min_parent_dist,
+            trimera_min_gap,
+            trimera_max_gap_error,
+            trimera_min_flank,
             threads,
             output,
         } => {
@@ -2203,9 +2206,13 @@ fn main() -> io::Result<()> {
                 .num_threads(threads)
                 .build()
                 .map_err(io::Error::other)?;
-            let rows = pool.install(|| {
-                chimera_diagnostics::run_diagnostics(&table, &params, trimera_min_cover_frac)
-            });
+            let crit = chimera_diagnostics::TrimeraCriteria {
+                min_parent_dist: trimera_min_parent_dist,
+                min_gap_len: trimera_min_gap,
+                max_gap_error_frac: trimera_max_gap_error,
+                min_flank: trimera_min_flank,
+            };
+            let rows = pool.install(|| chimera_diagnostics::run_diagnostics(&table, &params, crit));
 
             let mut out: Box<dyn io::Write> = match output {
                 Some(path) => Box::new(io::BufWriter::new(std::fs::File::create(&path)?)),
