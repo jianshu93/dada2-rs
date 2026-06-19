@@ -42,7 +42,7 @@ use learn_errors::{
     load_fastq_samples,
 };
 use misc::{DADA2_RS_VERSION, Tagged, read_fasta_records, read_tagged_json};
-use nwalign::AlignParams;
+use nwalign::{AlignBackend, AlignParams};
 use remove_bimera::{BimeraParams, Method, remove_bimera_denovo};
 use remove_primers::{RemovePrimersParams, iupac_reverse_complement, remove_primers};
 use sequence_table::{HashAlgo, OrderBy, SequenceTable, make_sequence_table};
@@ -144,6 +144,7 @@ fn build_learned_err_params(
         band: ap.band,
         vectorized: ap.vectorized,
         gapless: ap.gapless,
+        backend: ap.backend,
     }
 }
 
@@ -430,6 +431,7 @@ fn main() -> io::Result<()> {
             gap_p,
             match_score,
             mismatch,
+            align_backend,
             max_clust,
             greedy,
             use_quals,
@@ -531,6 +533,7 @@ fn main() -> io::Result<()> {
                     kdist_cutoff,
                     kmer_size,
                     no_kmer_screen,
+                    align_backend,
                 )?;
 
                 // Samples are independent and single-pass (load -> denoise ->
@@ -685,6 +688,7 @@ fn main() -> io::Result<()> {
                 kdist_cutoff,
                 kmer_size,
                 no_kmer_screen,
+                align_backend,
             )?;
             let dada_params = resolved.params;
             let run_params = resolved.run;
@@ -897,6 +901,7 @@ fn main() -> io::Result<()> {
             gap_p,
             match_score,
             mismatch,
+            align_backend,
             max_clust,
             greedy,
             use_quals,
@@ -1114,6 +1119,7 @@ fn main() -> io::Result<()> {
                 kdist_cutoff,
                 kmer_size,
                 no_kmer_screen,
+                align_backend,
             )?;
             let dada_params = resolved.params;
             let mut run_params = resolved.run;
@@ -1267,6 +1273,7 @@ fn main() -> io::Result<()> {
             gap_p,
             match_score,
             mismatch,
+            align_backend,
             max_clust,
             greedy,
             use_quals,
@@ -1341,6 +1348,7 @@ fn main() -> io::Result<()> {
                 kdist_cutoff,
                 kmer_size,
                 no_kmer_screen,
+                align_backend,
             )?;
 
             // ---- Round 1: denoise each sample independently (no priors) ----
@@ -2090,6 +2098,7 @@ fn main() -> io::Result<()> {
             match_score,
             mismatch,
             gap_p,
+            align_backend,
             min_sample_fraction,
             ignore_n_negatives,
             threads,
@@ -2117,6 +2126,7 @@ fn main() -> io::Result<()> {
                 match_score,
                 mismatch,
                 gap_p,
+                backend: align_backend.unwrap_or_default(),
             };
 
             let pool = rayon::ThreadPoolBuilder::new()
@@ -2444,6 +2454,7 @@ fn main() -> io::Result<()> {
             gap_p,
             match_score,
             mismatch,
+            align_backend,
             max_clust,
             greedy,
             use_quals,
@@ -2529,6 +2540,7 @@ fn main() -> io::Result<()> {
             };
 
             let align_params = AlignParams {
+                backend: align_backend.unwrap_or_default(),
                 match_score,
                 mismatch,
                 gap_p,
@@ -3118,6 +3130,7 @@ fn main() -> io::Result<()> {
             gap_p,
             match_score,
             mismatch,
+            align_backend,
             max_clust,
             greedy,
             use_quals,
@@ -3203,6 +3216,7 @@ fn main() -> io::Result<()> {
             };
 
             let align_params = AlignParams {
+                backend: align_backend.unwrap_or_default(),
                 match_score,
                 mismatch,
                 gap_p,
@@ -3506,6 +3520,7 @@ fn resolve_dada_params(
     kdist_cutoff: Option<f64>,
     kmer_size: Option<usize>,
     no_kmer_screen: Option<bool>,
+    align_backend: Option<AlignBackend>,
 ) -> io::Result<ResolvedDada> {
     let em: ErrorModelJson = read_tagged_json(error_model, &["learn-errors", "errors-from-sample"])
         .with_path(error_model)?;
@@ -3575,6 +3590,7 @@ fn resolve_dada_params(
         (None, true, Some(em_params)) => em_params.use_kmers,
         _ => true,
     };
+    let backend = resolve!(align_backend, backend, AlignBackend::Nw);
 
     // ---- Consistency warnings (only when NOT inheriting) ----
     if !inherit_err_params && let Some(em_params) = p {
@@ -3605,6 +3621,7 @@ fn resolve_dada_params(
         check!("kdist_cutoff", kdist_cutoff, em_params.kdist_cutoff);
         check!("kmer_size", kmer_size, em_params.kmer_size);
         check!("use_kmers", use_kmers, em_params.use_kmers);
+        check!("align_backend", backend, em_params.backend);
         if !mismatches.is_empty() {
             eprintln!(
                 "[dada] warning: {} dada parameter(s) differ from error model {}; pass --inherit-err-params to adopt the err model's values:",
@@ -3618,6 +3635,7 @@ fn resolve_dada_params(
     }
 
     let align_params = AlignParams {
+        backend,
         match_score,
         mismatch,
         gap_p,
