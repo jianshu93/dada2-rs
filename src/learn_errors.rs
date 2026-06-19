@@ -205,6 +205,12 @@ pub struct LearnedErrParams {
     #[serde(default)]
     pub backend: crate::nwalign::AlignBackend,
 
+    /// WFA edit-budget cap the model was learned with (issue #51), in edit
+    /// operations; `0` = unbounded. Defaults to 0 for JSONs produced before this
+    /// field existed. Only meaningful for the `wfa2` backend.
+    #[serde(default)]
+    pub wfa_max_edits: i32,
+
     /// Loess configuration captured from the errfun. Present for errfuns that
     /// use loess fitting (`loess`, `noqual`, `binned-qual`, `pacbio`); absent
     /// for `external`. Records the resolved surface/cell/clamp values *after*

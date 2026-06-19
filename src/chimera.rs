@@ -11,7 +11,7 @@ use rayon::prelude::*;
 
 use crate::nwalign::{
     AlignBackend, AlignBuffers, VectorizedAlignScores, align_vectorized_with_buf,
-    align_wfa_endsfree_with_buf,
+    align_wfa_endsfree_with_buf, wfa_cost_cap,
 };
 
 /// Align `sq` against `par` (ends-free) into `buf`, dispatching on `backend`.
@@ -23,6 +23,7 @@ fn bimera_align(
     par: &[u8],
     scores: &VectorizedAlignScores,
     backend: AlignBackend,
+    max_steps: i32,
     buf: &mut AlignBuffers,
 ) {
     match backend {
@@ -34,6 +35,7 @@ fn bimera_align(
             scores.mismatch as i32,
             scores.gap_p as i32,
             scores.band,
+            max_steps,
             buf,
         ),
     }
@@ -188,6 +190,9 @@ pub struct BimeraAlignParams {
     /// Pairwise-alignment backend (issue #49). `Nw` uses the vectorized NW;
     /// `Wfa2` routes through the experimental WFA backend.
     pub backend: AlignBackend,
+    /// WFA edit-budget cap (issue #51), in edit operations; `0` = unbounded.
+    /// Only meaningful for the `Wfa2` backend. See [`AlignParams::wfa_max_edits`].
+    pub wfa_max_edits: i32,
 }
 
 /// Determine whether `sq` is a bimera of any pair from `parents`.
@@ -224,6 +229,7 @@ pub fn is_bimera_with_buf(
         gap_p,
         max_shift,
         backend,
+        wfa_max_edits,
     } = *params;
     let align_scores = VectorizedAlignScores {
         match_score,
@@ -232,6 +238,7 @@ pub fn is_bimera_with_buf(
         end_gap_p: 0,
         band: max_shift,
     };
+    let max_steps = wfa_cost_cap(wfa_max_edits, gap_p as i32);
     let sqlen = sq.len();
     let mut max_left = 0usize;
     let mut max_right = 0usize;
@@ -241,7 +248,7 @@ pub fn is_bimera_with_buf(
     let mut oo_max_right_oo = 0usize;
 
     for &par in parents {
-        bimera_align(sq, par, &align_scores, backend, buf);
+        bimera_align(sq, par, &align_scores, backend, max_steps, buf);
         let (al0, al1) = buf.alignment();
         let (left, right, left_oo, right_oo) = get_lr(al0, al1, allow_one_off, max_shift as usize);
 
@@ -324,6 +331,7 @@ pub fn table_bimera2(
         gap_p,
         max_shift,
         backend,
+        wfa_max_edits,
     } = *params;
     let align_scores = VectorizedAlignScores {
         match_score,
@@ -332,6 +340,7 @@ pub fn table_bimera2(
         end_gap_p: 0,
         band: max_shift,
     };
+    let max_steps = wfa_cost_cap(wfa_max_edits, gap_p as i32);
     assert_eq!(mat.len(), nrow * ncol, "mat length must be nrow * ncol");
     assert_eq!(seqs.len(), ncol, "seqs length must equal ncol");
 
@@ -370,7 +379,7 @@ pub fn table_bimera2(
 
                     // Compute alignment if not cached for this (j, k) pair.
                     if cache[k].is_none() {
-                        bimera_align(seqs[j], seqs[k], &align_scores, backend, buf);
+                        bimera_align(seqs[j], seqs[k], &align_scores, backend, max_steps, buf);
                         let (al0, al1) = buf.alignment();
                         let (left, right, left_oo, right_oo) =
                             get_lr(al0, al1, allow_one_off, max_shift as usize);

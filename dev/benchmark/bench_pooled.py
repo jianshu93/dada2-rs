@@ -66,6 +66,7 @@ Run `python3 bench_pooled.py --help` for all options.
 import argparse
 import concurrent.futures
 import glob
+import json
 import os
 import re
 import subprocess
@@ -104,20 +105,30 @@ def maybe_verbose(cmd):
 # honest "R-NW vs dada2-rs-WFA" comparison.
 ALIGN_BACKEND = "nw"
 
-# dada2-rs subcommands that actually align (and accept --align-backend). Note the
-# chimera step (remove-bimera-denovo) aligns too, on its own path, so it's here.
+# Set from --wfa-max-edits in main() (or per-iteration by the cap sweep). The WFA
+# edit-budget cap (issue #51); None = leave the binary's own default. Only ever
+# injected alongside the wfa2 backend.
+WFA_MAX_EDITS = None
+
+# dada2-rs subcommands that actually align (and accept --align-backend /
+# --wfa-max-edits). Note the chimera step (remove-bimera-denovo) aligns too, on
+# its own path, so it's here.
 RS_ALIGN_SUBCMDS = {
     "learn-errors", "dada", "dada-pooled", "dada-pseudo", "remove-bimera-denovo",
 }
 
 
 def maybe_align_backend(cmd):
-    """Append --align-backend to a dada2-rs alignment subcommand (keyed on cmd[1])
-    when a non-default backend is selected. Only injected for wfa2 so default
-    (nw) runs are byte-identical to before and work with any binary; R commands
-    and non-aligning steps (filter, merge, make-table) are left untouched."""
+    """Append --align-backend (and --wfa-max-edits, if set) to a dada2-rs
+    alignment subcommand (keyed on cmd[1]) when a non-default backend is
+    selected. Only injected for wfa2 so default (nw) runs are byte-identical to
+    before and work with any binary; R commands and non-aligning steps (filter,
+    merge, make-table) are left untouched. The cap rides with wfa2 only — it is
+    meaningless for nw, and the binary ignores it there anyway."""
     if ALIGN_BACKEND != "nw" and len(cmd) > 1 and str(cmd[1]) in RS_ALIGN_SUBCMDS:
-        return [*cmd, "--align-backend", ALIGN_BACKEND]
+        cmd = [*cmd, "--align-backend", ALIGN_BACKEND]
+        if WFA_MAX_EDITS is not None:
+            cmd = [*cmd, "--wfa-max-edits", str(WFA_MAX_EDITS)]
     return cmd
 
 R_STEPS = {
@@ -499,6 +510,77 @@ def sample_jobs_sweep(args, bin_, outdir):
     print(f"  Wrote {csv_path}")
 
 
+def count_asvs(nochim_json):
+    """Final ASV count = number of sequences in a make-sequence-table /
+    remove-bimera-denovo JSON. Returns None if the file is missing/unreadable."""
+    try:
+        with open(nochim_json) as fh:
+            return len(json.load(fh)["sequences"])
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def wfa_max_edits_sweep(args, bin_, outdir):
+    """Sweep the WFA edit-budget cap (--wfa-max-edits, issue #51) over the FULL
+    dada2-rs pipeline, reporting end-to-end wall / cores / peak RSS and — the key
+    correctness signal — the final post-chimera ASV count at each cap.
+
+    Unlike the thread / sample-jobs sweeps this re-runs the whole pipeline per
+    cap (not just denoise): the cap also governs learn-errors, which is where the
+    WFA O(n·s) cost concentrates on divergent pairs, so a denoise-only sweep
+    would miss most of the effect. WFA-only; forces --align-backend wfa2."""
+    global ALIGN_BACKEND, WFA_MAX_EDITS
+    if ALIGN_BACKEND != "wfa2":
+        print("  [wfa-max-edits-sweep] forcing --align-backend wfa2 (the cap only "
+              "affects the WFA path)", flush=True)
+        ALIGN_BACKEND = "wfa2"
+    # 0 = unbounded; accept it as a sweep point alongside positive caps.
+    sweep = [int(e) for e in args.wfa_max_edits_sweep.split(",")]
+    run_pipeline = rust_illumina if args.platform == "illumina" else rust_pacbio
+
+    rows = []
+    for e in sweep:
+        WFA_MAX_EDITS = e
+        label = "unbounded" if e == 0 else f"{e} edits"
+        print(f"\n=== full pipeline @ --wfa-max-edits {e} ({label}) ===", flush=True)
+        edir = outdir / (f"e{e}")
+        edir.mkdir(parents=True, exist_ok=True)
+        res = []
+        run_pipeline(args, bin_, edir, res)
+        rows_c = collapse(res)
+        wall = sum(r["wall_s"] for r in rows_c)
+        cpu = sum(r.get("cpu_s", 0.0) for r in rows_c)
+        peak = max((r["maxrss_kb"] for r in rows_c), default=0)
+        rows.append({"edits": e, "wall_s": wall, "cpu_s": cpu, "maxrss_kb": peak,
+                     "cores": cpu / wall if wall > 0 else 0.0,
+                     "n_asv": count_asvs(edir / "seqtab_nochim.json")})
+
+    base_asv = rows[0]["n_asv"]
+    print("\n" + "=" * 74)
+    print(f"WFA-MAX-EDITS SWEEP — {args.platform} {args.pool}, {args.threads} thread(s), "
+          "full pipeline")
+    print("=" * 74)
+    print(f"  {'edits':>8}{'wall_s':>10}{'cores':>8}{'peak_rss':>11}{'n_asv':>8}{'Δasv':>7}")
+    csv_path = outdir / "sweep_wfa_edits.csv"
+    with open(csv_path, "w") as cf:
+        cf.write("wfa_max_edits,wall_s,cpu_s,cores,maxrss_kb,n_asv\n")
+        for r in rows:
+            elab = "unbnd" if r["edits"] == 0 else str(r["edits"])
+            dasv = ("" if r["n_asv"] is None or base_asv is None
+                    else f"{r['n_asv'] - base_asv:+d}")
+            nasv = "—" if r["n_asv"] is None else str(r["n_asv"])
+            print(f"  {elab:>8}{r['wall_s']:>10.2f}{r['cores']:>8.1f}"
+                  f"{fmt_rss(r['maxrss_kb']):>11}{nasv:>8}{dasv:>7}")
+            cf.write(f"{r['edits']},{r['wall_s']:.2f},{r['cpu_s']:.2f},"
+                     f"{r['cores']:.2f},{r['maxrss_kb']:.0f},"
+                     f"{'' if r['n_asv'] is None else r['n_asv']}\n")
+    print("\n  Δasv is vs the FIRST sweep point. The cap is correctness-neutral by "
+          "design\n  (capped pairs fall back to NW), so Δasv should stay 0 across "
+          "caps generous\n  enough not to truncate real error-copies — that is the "
+          "value to watch.")
+    print(f"  Wrote {csv_path}")
+
+
 # --------------------------------------------------------------------------
 # R DADA2 pipeline — one Rscript process per step (symmetric per-step RSS)
 # --------------------------------------------------------------------------
@@ -705,6 +787,19 @@ def main():
                         "'nw' (default) = Needleman-Wunsch; 'wfa2' = experimental WFA. "
                         "R DADA2 always uses NW, so --align-backend wfa2 --run-r compares "
                         "R-NW vs dada2-rs-WFA. Default nw leaves command lines unchanged.")
+    p.add_argument("--wfa-max-edits", type=int, default=None, metavar="N",
+                   help="dada2-rs WFA edit-budget cap (issue #51), passed to every "
+                        "alignment step when --align-backend wfa2. 0 = unbounded. "
+                        "Default: leave the binary's own default (50). Only meaningful "
+                        "with wfa2.")
+    p.add_argument("--wfa-max-edits-sweep", default=None, metavar="N,N,...",
+                   help="WFA-only study: run the FULL pipeline once per cap value "
+                        "(forces --align-backend wfa2), reporting end-to-end wall / "
+                        "cores / peak RSS and the final post-chimera ASV count at each "
+                        "cap. Include 0 for the unbounded reference. The cap is "
+                        "correctness-neutral (capped pairs fall back to NW), so watch "
+                        "that n_asv holds while wall drops. e.g. --wfa-max-edits-sweep "
+                        "0,20,30,40,50,80")
     p.add_argument("--no-run-rust", action="store_true", help="skip the dada2-rs pipeline")
     p.add_argument("--verbose", action="store_true",
                    help="pass --verbose to each dada2-rs step (filter/remove-primers/"
@@ -743,9 +838,10 @@ def main():
     p.add_argument("--max-n", type=int, default=0)
     args = p.parse_args()
 
-    global VERBOSE, ALIGN_BACKEND
+    global VERBOSE, ALIGN_BACKEND, WFA_MAX_EDITS
     VERBOSE = args.verbose
     ALIGN_BACKEND = args.align_backend
+    WFA_MAX_EDITS = args.wfa_max_edits
 
     if args.trunc_q is None:
         args.trunc_q = 2 if args.platform == "illumina" else 0
@@ -767,6 +863,13 @@ def main():
         print(f"=== sample-jobs sweep: dada2-rs ({args.platform}, {args.pool}) — {bin_} ===",
               flush=True)
         sample_jobs_sweep(args, bin_, outdir)
+        return
+
+    if args.wfa_max_edits_sweep:
+        bin_ = find_binary(args.dada2rs)
+        print(f"=== wfa-max-edits sweep: dada2-rs ({args.platform}, {args.pool}) — {bin_} ===",
+              flush=True)
+        wfa_max_edits_sweep(args, bin_, outdir)
         return
 
     rust_results, r_split_results, r_split_nasv, r_single = [], [], None, None

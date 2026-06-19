@@ -254,6 +254,20 @@ pub enum Commands {
         #[arg(long, value_enum)]
         align_backend: Option<AlignBackend>,
 
+        /// EXPERIMENTAL (with `--align-backend wfa2`): WFA edit-budget cap, in
+        /// edit operations. WFA aborts a pair once it needs more than this many
+        /// edits and falls back to the NW path for that pair (NW-identical there).
+        /// The budget is an absolute edit count, NOT a fraction of read length:
+        /// denoising only aligns near-identical reads (~99.9% identity), so real
+        /// error-copies stay a few edits apart regardless of read length, while
+        /// divergent non-error-copy pairs that slip past the k-mer screen are
+        /// bounded. Ignored for the `nw` backend. 0 = unbounded. [default: 50]
+        /// (Internally an edit budget E maps to a WFA cost of E·|gap_p|, e.g.
+        /// 50·8 = 400 with default scoring; the DADA2RS_WFA_MAX_STEPS env
+        /// override is specified in those raw cost units, not edits.)
+        #[arg(long)]
+        wfa_max_edits: Option<i32>,
+
         /// Maximum number of clusters to infer (R's MAX_CLUST). 0 = unlimited.
         #[arg(long)]
         max_clust: Option<usize>,
@@ -445,6 +459,20 @@ pub enum Commands {
         #[arg(long, value_enum)]
         align_backend: Option<AlignBackend>,
 
+        /// EXPERIMENTAL (with `--align-backend wfa2`): WFA edit-budget cap, in
+        /// edit operations. WFA aborts a pair once it needs more than this many
+        /// edits and falls back to the NW path for that pair (NW-identical there).
+        /// The budget is an absolute edit count, NOT a fraction of read length:
+        /// denoising only aligns near-identical reads (~99.9% identity), so real
+        /// error-copies stay a few edits apart regardless of read length, while
+        /// divergent non-error-copy pairs that slip past the k-mer screen are
+        /// bounded. Ignored for the `nw` backend. 0 = unbounded. [default: 50]
+        /// (Internally an edit budget E maps to a WFA cost of E·|gap_p|, e.g.
+        /// 50·8 = 400 with default scoring; the DADA2RS_WFA_MAX_STEPS env
+        /// override is specified in those raw cost units, not edits.)
+        #[arg(long)]
+        wfa_max_edits: Option<i32>,
+
         /// Maximum number of clusters to infer (R's MAX_CLUST). 0 = unlimited.
         #[arg(long)]
         max_clust: Option<usize>,
@@ -615,6 +643,20 @@ pub enum Commands {
         /// Illumina and PacBio HiFi data, but alignments are not byte-identical.
         #[arg(long, value_enum)]
         align_backend: Option<AlignBackend>,
+
+        /// EXPERIMENTAL (with `--align-backend wfa2`): WFA edit-budget cap, in
+        /// edit operations. WFA aborts a pair once it needs more than this many
+        /// edits and falls back to the NW path for that pair (NW-identical there).
+        /// The budget is an absolute edit count, NOT a fraction of read length:
+        /// denoising only aligns near-identical reads (~99.9% identity), so real
+        /// error-copies stay a few edits apart regardless of read length, while
+        /// divergent non-error-copy pairs that slip past the k-mer screen are
+        /// bounded. Ignored for the `nw` backend. 0 = unbounded. [default: 50]
+        /// (Internally an edit budget E maps to a WFA cost of E·|gap_p|, e.g.
+        /// 50·8 = 400 with default scoring; the DADA2RS_WFA_MAX_STEPS env
+        /// override is specified in those raw cost units, not edits.)
+        #[arg(long)]
+        wfa_max_edits: Option<i32>,
 
         /// Maximum number of clusters to infer (R's MAX_CLUST). 0 = unlimited.
         #[arg(long)]
@@ -1108,6 +1150,20 @@ pub enum Commands {
         #[arg(long, value_enum)]
         align_backend: Option<AlignBackend>,
 
+        /// EXPERIMENTAL (with `--align-backend wfa2`): WFA edit-budget cap, in
+        /// edit operations. WFA aborts a pair once it needs more than this many
+        /// edits and falls back to the NW path for that pair (NW-identical there).
+        /// The budget is an absolute edit count, NOT a fraction of read length:
+        /// denoising only aligns near-identical reads (~99.9% identity), so real
+        /// error-copies stay a few edits apart regardless of read length, while
+        /// divergent non-error-copy pairs that slip past the k-mer screen are
+        /// bounded. Ignored for the `nw` backend. 0 = unbounded. [default: 50]
+        /// (Internally an edit budget E maps to a WFA cost of E·|gap_p|, e.g.
+        /// 50·8 = 400 with default scoring; the DADA2RS_WFA_MAX_STEPS env
+        /// override is specified in those raw cost units, not edits.)
+        #[arg(long)]
+        wfa_max_edits: Option<i32>,
+
         /// (consensus) Fraction of samples a sequence must be flagged in
         #[arg(long, default_value_t = 0.9)]
         min_sample_fraction: f64,
@@ -1552,6 +1608,20 @@ pub enum Commands {
         #[arg(long, value_enum)]
         align_backend: Option<AlignBackend>,
 
+        /// EXPERIMENTAL (with `--align-backend wfa2`): WFA edit-budget cap, in
+        /// edit operations. WFA aborts a pair once it needs more than this many
+        /// edits and falls back to the NW path for that pair (NW-identical there).
+        /// The budget is an absolute edit count, NOT a fraction of read length:
+        /// denoising only aligns near-identical reads (~99.9% identity), so real
+        /// error-copies stay a few edits apart regardless of read length, while
+        /// divergent non-error-copy pairs that slip past the k-mer screen are
+        /// bounded. Ignored for the `nw` backend. 0 = unbounded. [default: 50]
+        /// (Internally an edit budget E maps to a WFA cost of E·|gap_p|, e.g.
+        /// 50·8 = 400 with default scoring; the DADA2RS_WFA_MAX_STEPS env
+        /// override is specified in those raw cost units, not edits.)
+        #[arg(long)]
+        wfa_max_edits: Option<i32>,
+
         /// Maximum number of clusters to infer (R's MAX_CLUST). 0 = unlimited.
         #[arg(long, default_value_t = 0)]
         max_clust: usize,
@@ -1826,6 +1896,20 @@ pub enum Commands {
         /// Illumina and PacBio HiFi data, but alignments are not byte-identical.
         #[arg(long, value_enum)]
         align_backend: Option<AlignBackend>,
+
+        /// EXPERIMENTAL (with `--align-backend wfa2`): WFA edit-budget cap, in
+        /// edit operations. WFA aborts a pair once it needs more than this many
+        /// edits and falls back to the NW path for that pair (NW-identical there).
+        /// The budget is an absolute edit count, NOT a fraction of read length:
+        /// denoising only aligns near-identical reads (~99.9% identity), so real
+        /// error-copies stay a few edits apart regardless of read length, while
+        /// divergent non-error-copy pairs that slip past the k-mer screen are
+        /// bounded. Ignored for the `nw` backend. 0 = unbounded. [default: 50]
+        /// (Internally an edit budget E maps to a WFA cost of E·|gap_p|, e.g.
+        /// 50·8 = 400 with default scoring; the DADA2RS_WFA_MAX_STEPS env
+        /// override is specified in those raw cost units, not edits.)
+        #[arg(long)]
+        wfa_max_edits: Option<i32>,
 
         /// Maximum number of clusters to infer (R's MAX_CLUST). 0 = unlimited.
         #[arg(long, default_value_t = 0)]

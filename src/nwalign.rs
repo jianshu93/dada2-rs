@@ -56,6 +56,14 @@ pub enum AlignBackend {
 pub struct AlignParams {
     /// Which pairwise-alignment backend to use for the ends-free path.
     pub backend: AlignBackend,
+    /// WFA edit-budget cap (issue #51), in edit operations. WFA aborts once the
+    /// alignment needs more than this many edits and the pair falls back to the
+    /// banded NW path (byte-identical to the NW backend for that pair). Bounds
+    /// WFA's O(n·s) cost on divergent non-error-copy pairs that survive the
+    /// k-mer screen; real error-copies sit far under any sane budget given the
+    /// ~99.9% denoising-identity assumption. `0` = unbounded. Ignored for the NW
+    /// backend. Converted to a WFA cost via [`wfa_cost_cap`].
+    pub wfa_max_edits: i32,
     pub match_score: i32,
     pub mismatch: i32,
     pub gap_p: i32,
@@ -1073,7 +1081,7 @@ pub fn align_vectorized_with_buf(
 
 use std::cell::RefCell;
 use std::sync::LazyLock;
-use wfa2lib_rs::aligner::{AffineAligner, AlignmentScope};
+use wfa2lib_rs::aligner::{AffineAligner, AlignStatus, AlignmentScope};
 use wfa2lib_rs::heuristic::HeuristicStrategy;
 use wfa2lib_rs::penalties::{AffinePenalties, WavefrontPenalties};
 
@@ -1085,6 +1093,41 @@ static USE_WFA_BACKEND: LazyLock<bool> = LazyLock::new(|| {
         .map(|v| v.eq_ignore_ascii_case("wfa"))
         .unwrap_or(false)
 });
+
+/// Experimental WFA edit-budget cap (issue #51). When set to a positive value,
+/// WFA aborts as soon as the alignment *cost* (WFA score, in penalty units)
+/// exceeds this bound, and the pair falls back to the banded NW path. This
+/// exploits the DADA2 denoising assumption that real error-copies are extremely
+/// similar (~99.9% identity): clearly-divergent pairs that survive the k-mer
+/// screen otherwise pay WFA's full O(n·s) extend cost, which dominates the
+/// PacBio slowdown. The fallback keeps results byte-identical to NW for exactly
+/// those capped pairs while WFA's fast path serves the similar majority.
+///
+/// `0` / unset disables the cap (`i32::MAX`). The value is a WFA *cost*, not an
+/// edit count: with default scoring an indel costs `-gap_p` (8) and a mismatch
+/// `-mismatch` (4), so e.g. a 40-edit budget ≈ 320.
+static WFA_MAX_STEPS: LazyLock<i32> = LazyLock::new(|| {
+    std::env::var("DADA2RS_WFA_MAX_STEPS")
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(i32::MAX)
+});
+
+/// Convert an edit-operation budget into a WFA *cost* cap (the unit
+/// `set_max_alignment_steps` compares against). The worst case for `E` edits is
+/// all of them being the most expensive op — a gap, cost `|gap_p|` — so an
+/// alignment needing ≤ `E` edits always has cost ≤ `E·|gap_p|`. Capping cost at
+/// that bound therefore never truncates an alignment within budget, regardless
+/// of the scoring scheme. `max_edits <= 0` means unbounded.
+#[inline]
+pub fn wfa_cost_cap(max_edits: i32, gap_p: i32) -> i32 {
+    if max_edits > 0 {
+        max_edits.saturating_mul(gap_p.abs())
+    } else {
+        i32::MAX
+    }
+}
 
 /// Convert a WFA CIGAR (`M`/`X`/`I`/`D` ops, pattern=s1, text=s2) into the
 /// gap-annotated `[al0, al1]` pair the rest of the module consumes.
@@ -1137,6 +1180,7 @@ fn cigar_to_alignment_into(ops: &[u8], s1: &[u8], s2: &[u8], al0: &mut Vec<u8>, 
 /// reaches its zero-alloc steady state; it is rebuilt only when the scoring or
 /// band changes (both constant within a run).
 #[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
 pub fn align_wfa_endsfree_with_buf(
     s1: &[u8],
     s2: &[u8],
@@ -1144,6 +1188,7 @@ pub fn align_wfa_endsfree_with_buf(
     mismatch: i32,
     gap_p: i32,
     band: i32,
+    max_steps: i32,
     buf: &mut AlignBuffers,
 ) {
     // A `thread_local` (rather than a field on `AlignBuffers`) keeps the aligner
@@ -1182,6 +1227,17 @@ pub fn align_wfa_endsfree_with_buf(
             *slot = Some((key, aligner));
         }
         let aligner = &mut slot.as_mut().unwrap().1;
+        // Edit-budget cap (issue #51): abort WFA once cost exceeds the bound so
+        // divergent pairs don't pay the full O(n·s) extend. Capped pairs fall
+        // back to NW below. `max_steps` is the caller's cost cap (from
+        // `wfa_cost_cap`); the `DADA2RS_WFA_MAX_STEPS` env var overrides it for
+        // ad-hoc sweeps. i32::MAX = unbounded.
+        let cap = if *WFA_MAX_STEPS != i32::MAX {
+            *WFA_MAX_STEPS
+        } else {
+            max_steps
+        };
+        aligner.set_max_alignment_steps(cap);
         // Full ends-free: leading/trailing gaps on either strand are free.
         aligner.set_alignment_free_ends(
             s1.len() as i32,
@@ -1190,6 +1246,24 @@ pub fn align_wfa_endsfree_with_buf(
             s2.len() as i32,
         );
         aligner.align_endsfree(s1, s2);
+        // On MaxStepsReached the CIGAR is left empty; fall back to the banded NW
+        // ends-free path so the pair still gets a valid alignment (byte-identical
+        // to the pure-NW backend for exactly these capped, divergent pairs).
+        if aligner.status() == AlignStatus::MaxStepsReached {
+            align_vectorized_with_buf(
+                s1,
+                s2,
+                &VectorizedAlignScores {
+                    match_score: match_score as i16,
+                    mismatch: mismatch as i16,
+                    gap_p: gap_p as i16,
+                    end_gap_p: 0,
+                    band,
+                },
+                buf,
+            );
+            return;
+        }
         let ops = aligner.cigar().operations_slice();
         cigar_to_alignment_into(ops, s1, s2, &mut buf.al0, &mut buf.al1);
     });
@@ -1352,6 +1426,7 @@ pub fn raw_align_with_buf(
             p.mismatch,
             p.gap_p,
             p.band,
+            wfa_cost_cap(p.wfa_max_edits, p.gap_p),
             buf,
         );
         return Some(());
@@ -1895,7 +1970,7 @@ mod tests {
     fn compare_wfa(s1: &[u8], s2: &[u8], label: &str) {
         let ef = align_endsfree(s1, s2, MATCH, MM, GAP, BAND);
         let mut buf = AlignBuffers::new();
-        align_wfa_endsfree_with_buf(s1, s2, MATCH, MM, GAP, BAND, &mut buf);
+        align_wfa_endsfree_with_buf(s1, s2, MATCH, MM, GAP, BAND, i32::MAX, &mut buf);
         let wfa = [buf.al0.clone(), buf.al1.clone()];
 
         let score_ef = score_alignment(&ef, MATCH, MM, GAP);
@@ -2002,7 +2077,7 @@ mod tests {
             // Ends-free: WFA endsfree vs scalar align_endsfree, for comparison.
             let e_scalar = align_endsfree(&s1, &s2, 5, -4, -8, -1);
             let mut buf = AlignBuffers::new();
-            align_wfa_endsfree_with_buf(&s1, &s2, 5, -4, -8, -1, &mut buf);
+            align_wfa_endsfree_with_buf(&s1, &s2, 5, -4, -8, -1, i32::MAX, &mut buf);
             let e_wfa = [buf.al0.clone(), buf.al1.clone()];
             if score_alignment(&e_scalar, 5, -4, -8) != score_alignment(&e_wfa, 5, -4, -8) {
                 endsfree_fails += 1;
@@ -2045,7 +2120,7 @@ mod tests {
             }
             let ef = align_endsfree(&s1, &s2, 5, -4, -8, -1);
             let mut buf = AlignBuffers::new();
-            align_wfa_endsfree_with_buf(&s1, &s2, 5, -4, -8, -1, &mut buf);
+            align_wfa_endsfree_with_buf(&s1, &s2, 5, -4, -8, -1, i32::MAX, &mut buf);
             let wfa = [buf.al0.clone(), buf.al1.clone()];
             let sef = score_alignment(&ef, 5, -4, -8);
             let swfa = score_alignment(&wfa, 5, -4, -8);
@@ -2107,7 +2182,7 @@ mod tests {
             }
             let ef = align_endsfree(&s1, &s2, 5, -4, -8, -1);
             let mut buf = AlignBuffers::new();
-            align_wfa_endsfree_with_buf(&s1, &s2, 5, -4, -8, -1, &mut buf);
+            align_wfa_endsfree_with_buf(&s1, &s2, 5, -4, -8, -1, i32::MAX, &mut buf);
             let wfa = [buf.al0.clone(), buf.al1.clone()];
             total_by_edits[nedits] += 1;
             if score_alignment(&ef, 5, -4, -8) != score_alignment(&wfa, 5, -4, -8) {
@@ -2302,6 +2377,7 @@ mod tests {
 
         let params = AlignParams {
             backend: AlignBackend::Nw,
+            wfa_max_edits: 0,
             match_score: 5,
             mismatch: -4,
             gap_p: -8,
