@@ -3674,6 +3674,10 @@ fn resolve_dada_params(
         gapless: true,
     };
 
+    if verbose {
+        eprintln!("[dada] {}", nwalign::backend_repr(&align_params));
+    }
+
     let params = dada::DadaParams {
         align: align_params,
         err_mat,

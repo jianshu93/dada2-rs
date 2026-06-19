@@ -681,6 +681,10 @@ pub fn learn_errors(
             nq,
             max_consist,
         );
+        eprintln!(
+            "[learn_errors] {}",
+            crate::nwalign::backend_repr(&dada_params.align)
+        );
     }
 
     dada_params.err_ncol = nq;

@@ -1129,6 +1129,23 @@ pub fn wfa_cost_cap(max_edits: i32, gap_p: i32) -> i32 {
     }
 }
 
+/// One-line, human-readable descriptor of the alignment backend in effect, for
+/// `--verbose` logs so archived runs are self-labeling (issue #51). The WFA
+/// edit-budget cap is shown only for the WFA backend (it is inert under NW).
+pub fn backend_repr(p: &AlignParams) -> String {
+    match p.backend {
+        AlignBackend::Nw => "alignment backend: nw (Needleman-Wunsch)".to_string(),
+        AlignBackend::Wfa2 => {
+            let cap = if p.wfa_max_edits > 0 {
+                format!("wfa-max-edits={}", p.wfa_max_edits)
+            } else {
+                "wfa-max-edits=0 (unbounded)".to_string()
+            };
+            format!("alignment backend: wfa2 (experimental WFA; {cap})")
+        }
+    }
+}
+
 /// Convert a WFA CIGAR (`M`/`X`/`I`/`D` ops, pattern=s1, text=s2) into the
 /// gap-annotated `[al0, al1]` pair the rest of the module consumes.
 ///
