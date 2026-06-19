@@ -2011,6 +2011,115 @@ mod tests {
         compare_wfa(&s1, &s2, "diff-len-short");
     }
 
+    // ---- WFA edit-budget cap (issue #51) -------------------------------------
+
+    /// WFA *cost* (Eizenga convention: matches free, interior mismatches and
+    /// gaps penalised) of an ends-free alignment — the unit `--wfa-max-edits` is
+    /// converted into via [`wfa_cost_cap`]. Lets a test assert a pair genuinely
+    /// exceeds (or sits under) a cap, so the NW-fallback checks aren't vacuous.
+    fn wfa_edit_cost(al: &[Vec<u8>; 2]) -> i32 {
+        let (al0, al1) = (&al[0], &al[1]);
+        let mut cost = 0;
+        for k in 0..al0.len() {
+            let g0 = al0[k] == b'-';
+            let g1 = al1[k] == b'-';
+            if !g0 && !g1 {
+                if al0[k] != al1[k] {
+                    cost += MM.abs();
+                }
+            } else {
+                let row = if g0 { al0 } else { al1 };
+                let interior = !row[..k].iter().all(|&b| b == b'-')
+                    && !row[k + 1..].iter().all(|&b| b == b'-');
+                if interior {
+                    cost += GAP.abs();
+                }
+            }
+        }
+        cost
+    }
+
+    fn nw_vectorized(s1: &[u8], s2: &[u8]) -> [Vec<u8>; 2] {
+        align_vectorized(
+            s1,
+            s2,
+            &VectorizedAlignScores {
+                match_score: MATCH as i16,
+                mismatch: MM as i16,
+                gap_p: GAP as i16,
+                end_gap_p: 0,
+                band: BAND,
+            },
+        )
+    }
+
+    /// When a pair's alignment exceeds the edit budget, WFA aborts and the pair
+    /// must fall back to the banded NW path — byte-identical to the NW backend.
+    #[test]
+    fn wfa_cap_triggers_nw_fallback_byte_identical() {
+        // ~6 substitutions over 20 bp: cost 24 > the 2-edit (cost-16) budget.
+        let s1 = encode("ACGTACGTACGTACGTACGT");
+        let s2 = encode("AGGTAAGTACCTACCTAGGT");
+        let cap = wfa_cost_cap(2, GAP); // 2 edits -> cost 16
+        let mut buf = AlignBuffers::new();
+        align_wfa_endsfree_with_buf(&s1, &s2, MATCH, MM, GAP, BAND, cap, &mut buf);
+
+        // Non-vacuity: the (uncapped) optimal really does exceed the budget, so
+        // the fallback path is the one under test.
+        let nw = nw_vectorized(&s1, &s2);
+        assert!(
+            wfa_edit_cost(&nw) > cap,
+            "test pair must exceed the cap (cost {} <= cap {cap})",
+            wfa_edit_cost(&nw),
+        );
+
+        assert_eq!(buf.al0, nw[0], "capped WFA al0 must equal NW fallback");
+        assert_eq!(buf.al1, nw[1], "capped WFA al1 must equal NW fallback");
+    }
+
+    /// A pair within budget must be untouched by the cap: a generous cap yields
+    /// exactly the uncapped WFA alignment (i.e. the fallback did NOT fire).
+    #[test]
+    fn wfa_cap_within_budget_matches_uncapped() {
+        let s1 = encode("ACGTACGTACGTACGT");
+        let s2 = encode("ACGTACGTTCGTACGT"); // 1 substitution
+        let cap = wfa_cost_cap(50, GAP); // 50 edits -> cost 400, far above
+
+        let mut capped = AlignBuffers::new();
+        let mut uncapped = AlignBuffers::new();
+        align_wfa_endsfree_with_buf(&s1, &s2, MATCH, MM, GAP, BAND, cap, &mut capped);
+        align_wfa_endsfree_with_buf(&s1, &s2, MATCH, MM, GAP, BAND, i32::MAX, &mut uncapped);
+
+        assert_eq!(
+            capped.al0, uncapped.al0,
+            "in-budget al0 must match uncapped"
+        );
+        assert_eq!(
+            capped.al1, uncapped.al1,
+            "in-budget al1 must match uncapped"
+        );
+
+        // And it really is under budget, so the match is the WFA path, not NW.
+        let cost = wfa_edit_cost(&[uncapped.al0.clone(), uncapped.al1.clone()]);
+        assert!(
+            cost <= cap,
+            "pair should be within budget (cost {cost} > cap {cap})"
+        );
+    }
+
+    /// `wfa_cost_cap` converts an edit budget into a WFA cost (`edits·|gap_p|`),
+    /// with `<= 0` meaning unbounded and no overflow on saturation.
+    #[test]
+    fn wfa_cost_cap_converts_edits_to_cost() {
+        assert_eq!(wfa_cost_cap(50, -8), 400);
+        assert_eq!(wfa_cost_cap(40, -4), 160);
+        assert_eq!(wfa_cost_cap(1, -8), 8);
+        assert_eq!(wfa_cost_cap(3, 8), 24); // positive gap_p: |gap_p| is used
+        assert_eq!(wfa_cost_cap(0, -8), i32::MAX); // 0 = unbounded
+        assert_eq!(wfa_cost_cap(-5, -8), i32::MAX); // negative = unbounded
+        assert_eq!(wfa_cost_cap(i32::MAX, -8), i32::MAX); // saturating, no panic
+    }
+
     /// Isolation experiment: compare WFA *global* (`align_end2end`) against the
     /// scalar *global* `align_standard` (both linear gap, penalized ends). If
     /// these agree where ends-free diverges, the divergence is purely in

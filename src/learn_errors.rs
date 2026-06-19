@@ -919,3 +919,34 @@ pub fn learn_errors(
         stop_reason,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Error-model JSONs written before the cap existed have no `wfa_max_edits`
+    /// field; `#[serde(default)]` must load them with the cap unset (0).
+    #[test]
+    fn learned_err_params_defaults_wfa_max_edits_when_absent() {
+        let p: LearnedErrParams = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            p.wfa_max_edits, 0,
+            "absent field must default to 0 (unbounded)"
+        );
+    }
+
+    /// A present `wfa_max_edits` is read back, and a round-trip preserves it.
+    #[test]
+    fn learned_err_params_roundtrips_wfa_max_edits() {
+        let p: LearnedErrParams = serde_json::from_str(r#"{"wfa_max_edits": 50}"#).unwrap();
+        assert_eq!(p.wfa_max_edits, 50);
+
+        let src = LearnedErrParams {
+            wfa_max_edits: 37,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&src).unwrap();
+        let back: LearnedErrParams = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.wfa_max_edits, 37);
+    }
+}
