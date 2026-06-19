@@ -56,6 +56,14 @@ pub enum AlignBackend {
 pub struct AlignParams {
     /// Which pairwise-alignment backend to use for the ends-free path.
     pub backend: AlignBackend,
+    /// WFA edit-budget cap (issue #51), in edit operations. WFA aborts once the
+    /// alignment needs more than this many edits and the pair falls back to the
+    /// banded NW path (byte-identical to the NW backend for that pair). Bounds
+    /// WFA's O(n·s) cost on divergent non-error-copy pairs that survive the
+    /// k-mer screen; real error-copies sit far under any sane budget given the
+    /// ~99.9% denoising-identity assumption. `0` = unbounded. Ignored for the NW
+    /// backend. Converted to a WFA cost via [`wfa_cost_cap`].
+    pub wfa_max_edits: i32,
     pub match_score: i32,
     pub mismatch: i32,
     pub gap_p: i32,
@@ -1073,7 +1081,7 @@ pub fn align_vectorized_with_buf(
 
 use std::cell::RefCell;
 use std::sync::LazyLock;
-use wfa2lib_rs::aligner::{AffineAligner, AlignmentScope};
+use wfa2lib_rs::aligner::{AffineAligner, AlignStatus, AlignmentScope};
 use wfa2lib_rs::heuristic::HeuristicStrategy;
 use wfa2lib_rs::penalties::{AffinePenalties, WavefrontPenalties};
 
@@ -1085,6 +1093,58 @@ static USE_WFA_BACKEND: LazyLock<bool> = LazyLock::new(|| {
         .map(|v| v.eq_ignore_ascii_case("wfa"))
         .unwrap_or(false)
 });
+
+/// Experimental WFA edit-budget cap (issue #51). When set to a positive value,
+/// WFA aborts as soon as the alignment *cost* (WFA score, in penalty units)
+/// exceeds this bound, and the pair falls back to the banded NW path. This
+/// exploits the DADA2 denoising assumption that real error-copies are extremely
+/// similar (~99.9% identity): clearly-divergent pairs that survive the k-mer
+/// screen otherwise pay WFA's full O(n·s) extend cost, which dominates the
+/// PacBio slowdown. The fallback keeps results byte-identical to NW for exactly
+/// those capped pairs while WFA's fast path serves the similar majority.
+///
+/// `0` / unset disables the cap (`i32::MAX`). The value is a WFA *cost*, not an
+/// edit count: with default scoring an indel costs `-gap_p` (8) and a mismatch
+/// `-mismatch` (4), so e.g. a 40-edit budget ≈ 320.
+static WFA_MAX_STEPS: LazyLock<i32> = LazyLock::new(|| {
+    std::env::var("DADA2RS_WFA_MAX_STEPS")
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(i32::MAX)
+});
+
+/// Convert an edit-operation budget into a WFA *cost* cap (the unit
+/// `set_max_alignment_steps` compares against). The worst case for `E` edits is
+/// all of them being the most expensive op — a gap, cost `|gap_p|` — so an
+/// alignment needing ≤ `E` edits always has cost ≤ `E·|gap_p|`. Capping cost at
+/// that bound therefore never truncates an alignment within budget, regardless
+/// of the scoring scheme. `max_edits <= 0` means unbounded.
+#[inline]
+pub fn wfa_cost_cap(max_edits: i32, gap_p: i32) -> i32 {
+    if max_edits > 0 {
+        max_edits.saturating_mul(gap_p.abs())
+    } else {
+        i32::MAX
+    }
+}
+
+/// One-line, human-readable descriptor of the alignment backend in effect, for
+/// `--verbose` logs so archived runs are self-labeling (issue #51). The WFA
+/// edit-budget cap is shown only for the WFA backend (it is inert under NW).
+pub fn backend_repr(p: &AlignParams) -> String {
+    match p.backend {
+        AlignBackend::Nw => "alignment backend: nw (Needleman-Wunsch)".to_string(),
+        AlignBackend::Wfa2 => {
+            let cap = if p.wfa_max_edits > 0 {
+                format!("wfa-max-edits={}", p.wfa_max_edits)
+            } else {
+                "wfa-max-edits=0 (unbounded)".to_string()
+            };
+            format!("alignment backend: wfa2 (experimental WFA; {cap})")
+        }
+    }
+}
 
 /// Convert a WFA CIGAR (`M`/`X`/`I`/`D` ops, pattern=s1, text=s2) into the
 /// gap-annotated `[al0, al1]` pair the rest of the module consumes.
@@ -1137,6 +1197,7 @@ fn cigar_to_alignment_into(ops: &[u8], s1: &[u8], s2: &[u8], al0: &mut Vec<u8>, 
 /// reaches its zero-alloc steady state; it is rebuilt only when the scoring or
 /// band changes (both constant within a run).
 #[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
 pub fn align_wfa_endsfree_with_buf(
     s1: &[u8],
     s2: &[u8],
@@ -1144,6 +1205,7 @@ pub fn align_wfa_endsfree_with_buf(
     mismatch: i32,
     gap_p: i32,
     band: i32,
+    max_steps: i32,
     buf: &mut AlignBuffers,
 ) {
     // A `thread_local` (rather than a field on `AlignBuffers`) keeps the aligner
@@ -1182,6 +1244,17 @@ pub fn align_wfa_endsfree_with_buf(
             *slot = Some((key, aligner));
         }
         let aligner = &mut slot.as_mut().unwrap().1;
+        // Edit-budget cap (issue #51): abort WFA once cost exceeds the bound so
+        // divergent pairs don't pay the full O(n·s) extend. Capped pairs fall
+        // back to NW below. `max_steps` is the caller's cost cap (from
+        // `wfa_cost_cap`); the `DADA2RS_WFA_MAX_STEPS` env var overrides it for
+        // ad-hoc sweeps. i32::MAX = unbounded.
+        let cap = if *WFA_MAX_STEPS != i32::MAX {
+            *WFA_MAX_STEPS
+        } else {
+            max_steps
+        };
+        aligner.set_max_alignment_steps(cap);
         // Full ends-free: leading/trailing gaps on either strand are free.
         aligner.set_alignment_free_ends(
             s1.len() as i32,
@@ -1190,6 +1263,24 @@ pub fn align_wfa_endsfree_with_buf(
             s2.len() as i32,
         );
         aligner.align_endsfree(s1, s2);
+        // On MaxStepsReached the CIGAR is left empty; fall back to the banded NW
+        // ends-free path so the pair still gets a valid alignment (byte-identical
+        // to the pure-NW backend for exactly these capped, divergent pairs).
+        if aligner.status() == AlignStatus::MaxStepsReached {
+            align_vectorized_with_buf(
+                s1,
+                s2,
+                &VectorizedAlignScores {
+                    match_score: match_score as i16,
+                    mismatch: mismatch as i16,
+                    gap_p: gap_p as i16,
+                    end_gap_p: 0,
+                    band,
+                },
+                buf,
+            );
+            return;
+        }
         let ops = aligner.cigar().operations_slice();
         cigar_to_alignment_into(ops, s1, s2, &mut buf.al0, &mut buf.al1);
     });
@@ -1352,6 +1443,7 @@ pub fn raw_align_with_buf(
             p.mismatch,
             p.gap_p,
             p.band,
+            wfa_cost_cap(p.wfa_max_edits, p.gap_p),
             buf,
         );
         return Some(());
@@ -1895,7 +1987,7 @@ mod tests {
     fn compare_wfa(s1: &[u8], s2: &[u8], label: &str) {
         let ef = align_endsfree(s1, s2, MATCH, MM, GAP, BAND);
         let mut buf = AlignBuffers::new();
-        align_wfa_endsfree_with_buf(s1, s2, MATCH, MM, GAP, BAND, &mut buf);
+        align_wfa_endsfree_with_buf(s1, s2, MATCH, MM, GAP, BAND, i32::MAX, &mut buf);
         let wfa = [buf.al0.clone(), buf.al1.clone()];
 
         let score_ef = score_alignment(&ef, MATCH, MM, GAP);
@@ -1934,6 +2026,115 @@ mod tests {
         let s1 = encode("ACGTACGTACGT");
         let s2 = encode("ACGTACGTACGTAC");
         compare_wfa(&s1, &s2, "diff-len-short");
+    }
+
+    // ---- WFA edit-budget cap (issue #51) -------------------------------------
+
+    /// WFA *cost* (Eizenga convention: matches free, interior mismatches and
+    /// gaps penalised) of an ends-free alignment — the unit `--wfa-max-edits` is
+    /// converted into via [`wfa_cost_cap`]. Lets a test assert a pair genuinely
+    /// exceeds (or sits under) a cap, so the NW-fallback checks aren't vacuous.
+    fn wfa_edit_cost(al: &[Vec<u8>; 2]) -> i32 {
+        let (al0, al1) = (&al[0], &al[1]);
+        let mut cost = 0;
+        for k in 0..al0.len() {
+            let g0 = al0[k] == b'-';
+            let g1 = al1[k] == b'-';
+            if !g0 && !g1 {
+                if al0[k] != al1[k] {
+                    cost += MM.abs();
+                }
+            } else {
+                let row = if g0 { al0 } else { al1 };
+                let interior = !row[..k].iter().all(|&b| b == b'-')
+                    && !row[k + 1..].iter().all(|&b| b == b'-');
+                if interior {
+                    cost += GAP.abs();
+                }
+            }
+        }
+        cost
+    }
+
+    fn nw_vectorized(s1: &[u8], s2: &[u8]) -> [Vec<u8>; 2] {
+        align_vectorized(
+            s1,
+            s2,
+            &VectorizedAlignScores {
+                match_score: MATCH as i16,
+                mismatch: MM as i16,
+                gap_p: GAP as i16,
+                end_gap_p: 0,
+                band: BAND,
+            },
+        )
+    }
+
+    /// When a pair's alignment exceeds the edit budget, WFA aborts and the pair
+    /// must fall back to the banded NW path — byte-identical to the NW backend.
+    #[test]
+    fn wfa_cap_triggers_nw_fallback_byte_identical() {
+        // ~6 substitutions over 20 bp: cost 24 > the 2-edit (cost-16) budget.
+        let s1 = encode("ACGTACGTACGTACGTACGT");
+        let s2 = encode("AGGTAAGTACCTACCTAGGT");
+        let cap = wfa_cost_cap(2, GAP); // 2 edits -> cost 16
+        let mut buf = AlignBuffers::new();
+        align_wfa_endsfree_with_buf(&s1, &s2, MATCH, MM, GAP, BAND, cap, &mut buf);
+
+        // Non-vacuity: the (uncapped) optimal really does exceed the budget, so
+        // the fallback path is the one under test.
+        let nw = nw_vectorized(&s1, &s2);
+        assert!(
+            wfa_edit_cost(&nw) > cap,
+            "test pair must exceed the cap (cost {} <= cap {cap})",
+            wfa_edit_cost(&nw),
+        );
+
+        assert_eq!(buf.al0, nw[0], "capped WFA al0 must equal NW fallback");
+        assert_eq!(buf.al1, nw[1], "capped WFA al1 must equal NW fallback");
+    }
+
+    /// A pair within budget must be untouched by the cap: a generous cap yields
+    /// exactly the uncapped WFA alignment (i.e. the fallback did NOT fire).
+    #[test]
+    fn wfa_cap_within_budget_matches_uncapped() {
+        let s1 = encode("ACGTACGTACGTACGT");
+        let s2 = encode("ACGTACGTTCGTACGT"); // 1 substitution
+        let cap = wfa_cost_cap(50, GAP); // 50 edits -> cost 400, far above
+
+        let mut capped = AlignBuffers::new();
+        let mut uncapped = AlignBuffers::new();
+        align_wfa_endsfree_with_buf(&s1, &s2, MATCH, MM, GAP, BAND, cap, &mut capped);
+        align_wfa_endsfree_with_buf(&s1, &s2, MATCH, MM, GAP, BAND, i32::MAX, &mut uncapped);
+
+        assert_eq!(
+            capped.al0, uncapped.al0,
+            "in-budget al0 must match uncapped"
+        );
+        assert_eq!(
+            capped.al1, uncapped.al1,
+            "in-budget al1 must match uncapped"
+        );
+
+        // And it really is under budget, so the match is the WFA path, not NW.
+        let cost = wfa_edit_cost(&[uncapped.al0.clone(), uncapped.al1.clone()]);
+        assert!(
+            cost <= cap,
+            "pair should be within budget (cost {cost} > cap {cap})"
+        );
+    }
+
+    /// `wfa_cost_cap` converts an edit budget into a WFA cost (`edits·|gap_p|`),
+    /// with `<= 0` meaning unbounded and no overflow on saturation.
+    #[test]
+    fn wfa_cost_cap_converts_edits_to_cost() {
+        assert_eq!(wfa_cost_cap(50, -8), 400);
+        assert_eq!(wfa_cost_cap(40, -4), 160);
+        assert_eq!(wfa_cost_cap(1, -8), 8);
+        assert_eq!(wfa_cost_cap(3, 8), 24); // positive gap_p: |gap_p| is used
+        assert_eq!(wfa_cost_cap(0, -8), i32::MAX); // 0 = unbounded
+        assert_eq!(wfa_cost_cap(-5, -8), i32::MAX); // negative = unbounded
+        assert_eq!(wfa_cost_cap(i32::MAX, -8), i32::MAX); // saturating, no panic
     }
 
     /// Isolation experiment: compare WFA *global* (`align_end2end`) against the
@@ -2002,7 +2203,7 @@ mod tests {
             // Ends-free: WFA endsfree vs scalar align_endsfree, for comparison.
             let e_scalar = align_endsfree(&s1, &s2, 5, -4, -8, -1);
             let mut buf = AlignBuffers::new();
-            align_wfa_endsfree_with_buf(&s1, &s2, 5, -4, -8, -1, &mut buf);
+            align_wfa_endsfree_with_buf(&s1, &s2, 5, -4, -8, -1, i32::MAX, &mut buf);
             let e_wfa = [buf.al0.clone(), buf.al1.clone()];
             if score_alignment(&e_scalar, 5, -4, -8) != score_alignment(&e_wfa, 5, -4, -8) {
                 endsfree_fails += 1;
@@ -2045,7 +2246,7 @@ mod tests {
             }
             let ef = align_endsfree(&s1, &s2, 5, -4, -8, -1);
             let mut buf = AlignBuffers::new();
-            align_wfa_endsfree_with_buf(&s1, &s2, 5, -4, -8, -1, &mut buf);
+            align_wfa_endsfree_with_buf(&s1, &s2, 5, -4, -8, -1, i32::MAX, &mut buf);
             let wfa = [buf.al0.clone(), buf.al1.clone()];
             let sef = score_alignment(&ef, 5, -4, -8);
             let swfa = score_alignment(&wfa, 5, -4, -8);
@@ -2107,7 +2308,7 @@ mod tests {
             }
             let ef = align_endsfree(&s1, &s2, 5, -4, -8, -1);
             let mut buf = AlignBuffers::new();
-            align_wfa_endsfree_with_buf(&s1, &s2, 5, -4, -8, -1, &mut buf);
+            align_wfa_endsfree_with_buf(&s1, &s2, 5, -4, -8, -1, i32::MAX, &mut buf);
             let wfa = [buf.al0.clone(), buf.al1.clone()];
             total_by_edits[nedits] += 1;
             if score_alignment(&ef, 5, -4, -8) != score_alignment(&wfa, 5, -4, -8) {
@@ -2302,6 +2503,7 @@ mod tests {
 
         let params = AlignParams {
             backend: AlignBackend::Nw,
+            wfa_max_edits: 0,
             match_score: 5,
             mismatch: -4,
             gap_p: -8,

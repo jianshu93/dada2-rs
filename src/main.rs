@@ -56,6 +56,11 @@ use taxonomy::{
 use crate::error_models::{LoessConfig, LoessSurface};
 use crate::misc::WithPath;
 
+/// Default WFA edit-budget cap (issue #51), in edit operations, used when the
+/// experimental `--align-backend wfa2` is selected without an explicit
+/// `--wfa-max-edits`. See [`nwalign::AlignParams::wfa_max_edits`].
+const WFA_MAX_EDITS_DEFAULT: i32 = 50;
+
 /// Resolve a [`LoessConfig`] from CLI inputs: preset + per-knob overrides.
 /// `--loess-surface`, `--loess-cell`, `--loess-max-rate`, and `--loess-min-rate`
 /// each override the preset's value for that knob if supplied.  `--loess-cell`
@@ -145,6 +150,7 @@ fn build_learned_err_params(
         vectorized: ap.vectorized,
         gapless: ap.gapless,
         backend: ap.backend,
+        wfa_max_edits: ap.wfa_max_edits,
     }
 }
 
@@ -432,6 +438,7 @@ fn main() -> io::Result<()> {
             match_score,
             mismatch,
             align_backend,
+            wfa_max_edits,
             max_clust,
             greedy,
             use_quals,
@@ -534,6 +541,7 @@ fn main() -> io::Result<()> {
                     kmer_size,
                     no_kmer_screen,
                     align_backend,
+                    wfa_max_edits,
                 )?;
 
                 // Samples are independent and single-pass (load -> denoise ->
@@ -689,6 +697,7 @@ fn main() -> io::Result<()> {
                 kmer_size,
                 no_kmer_screen,
                 align_backend,
+                wfa_max_edits,
             )?;
             let dada_params = resolved.params;
             let run_params = resolved.run;
@@ -902,6 +911,7 @@ fn main() -> io::Result<()> {
             match_score,
             mismatch,
             align_backend,
+            wfa_max_edits,
             max_clust,
             greedy,
             use_quals,
@@ -1120,6 +1130,7 @@ fn main() -> io::Result<()> {
                 kmer_size,
                 no_kmer_screen,
                 align_backend,
+                wfa_max_edits,
             )?;
             let dada_params = resolved.params;
             let mut run_params = resolved.run;
@@ -1274,6 +1285,7 @@ fn main() -> io::Result<()> {
             match_score,
             mismatch,
             align_backend,
+            wfa_max_edits,
             max_clust,
             greedy,
             use_quals,
@@ -1349,6 +1361,7 @@ fn main() -> io::Result<()> {
                 kmer_size,
                 no_kmer_screen,
                 align_backend,
+                wfa_max_edits,
             )?;
 
             // ---- Round 1: denoise each sample independently (no priors) ----
@@ -2099,6 +2112,7 @@ fn main() -> io::Result<()> {
             mismatch,
             gap_p,
             align_backend,
+            wfa_max_edits,
             min_sample_fraction,
             ignore_n_negatives,
             threads,
@@ -2127,6 +2141,7 @@ fn main() -> io::Result<()> {
                 mismatch,
                 gap_p,
                 backend: align_backend.unwrap_or_default(),
+                wfa_max_edits: wfa_max_edits.unwrap_or(WFA_MAX_EDITS_DEFAULT),
             };
 
             let pool = rayon::ThreadPoolBuilder::new()
@@ -2455,6 +2470,7 @@ fn main() -> io::Result<()> {
             match_score,
             mismatch,
             align_backend,
+            wfa_max_edits,
             max_clust,
             greedy,
             use_quals,
@@ -2541,6 +2557,7 @@ fn main() -> io::Result<()> {
 
             let align_params = AlignParams {
                 backend: align_backend.unwrap_or_default(),
+                wfa_max_edits: wfa_max_edits.unwrap_or(WFA_MAX_EDITS_DEFAULT),
                 match_score,
                 mismatch,
                 gap_p,
@@ -3131,6 +3148,7 @@ fn main() -> io::Result<()> {
             match_score,
             mismatch,
             align_backend,
+            wfa_max_edits,
             max_clust,
             greedy,
             use_quals,
@@ -3217,6 +3235,7 @@ fn main() -> io::Result<()> {
 
             let align_params = AlignParams {
                 backend: align_backend.unwrap_or_default(),
+                wfa_max_edits: wfa_max_edits.unwrap_or(WFA_MAX_EDITS_DEFAULT),
                 match_score,
                 mismatch,
                 gap_p,
@@ -3521,6 +3540,7 @@ fn resolve_dada_params(
     kmer_size: Option<usize>,
     no_kmer_screen: Option<bool>,
     align_backend: Option<AlignBackend>,
+    wfa_max_edits: Option<i32>,
 ) -> io::Result<ResolvedDada> {
     let em: ErrorModelJson = read_tagged_json(error_model, &["learn-errors", "errors-from-sample"])
         .with_path(error_model)?;
@@ -3591,6 +3611,10 @@ fn resolve_dada_params(
         _ => true,
     };
     let backend = resolve!(align_backend, backend, AlignBackend::Nw);
+    // WFA edit-budget cap default (issue #51): generous enough never to truncate
+    // a real error-copy alignment (those are ~99.9% identical), tight enough to
+    // bound divergent non-error-copy pairs that slip past the k-mer screen.
+    let wfa_max_edits = resolve!(wfa_max_edits, wfa_max_edits, WFA_MAX_EDITS_DEFAULT);
 
     // ---- Consistency warnings (only when NOT inheriting) ----
     if !inherit_err_params && let Some(em_params) = p {
@@ -3622,6 +3646,7 @@ fn resolve_dada_params(
         check!("kmer_size", kmer_size, em_params.kmer_size);
         check!("use_kmers", use_kmers, em_params.use_kmers);
         check!("align_backend", backend, em_params.backend);
+        check!("wfa_max_edits", wfa_max_edits, em_params.wfa_max_edits);
         if !mismatches.is_empty() {
             eprintln!(
                 "[dada] warning: {} dada parameter(s) differ from error model {}; pass --inherit-err-params to adopt the err model's values:",
@@ -3636,6 +3661,7 @@ fn resolve_dada_params(
 
     let align_params = AlignParams {
         backend,
+        wfa_max_edits,
         match_score,
         mismatch,
         gap_p,
@@ -3647,6 +3673,10 @@ fn resolve_dada_params(
         vectorized: true,
         gapless: true,
     };
+
+    if verbose {
+        eprintln!("[dada] {}", nwalign::backend_repr(&align_params));
+    }
 
     let params = dada::DadaParams {
         align: align_params,

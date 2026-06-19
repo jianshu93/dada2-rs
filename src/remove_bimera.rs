@@ -36,6 +36,9 @@ pub struct BimeraParams {
     pub gap_p: i16,
     /// Pairwise-alignment backend (issue #49).
     pub backend: AlignBackend,
+    /// WFA edit-budget cap (issue #51), in edit operations; `0` = unbounded.
+    /// Only meaningful for the `Wfa2` backend.
+    pub wfa_max_edits: i32,
 }
 
 // ---------------------------------------------------------------------------
@@ -133,6 +136,7 @@ fn consensus_flags(
         gap_p: p.gap_p,
         max_shift: p.max_shift,
         backend: p.backend,
+        wfa_max_edits: p.wfa_max_edits,
     };
     let flags = table_bimera2(
         mat,
@@ -177,6 +181,7 @@ fn pooled_flags(
         gap_p: p.gap_p,
         max_shift: p.max_shift,
         backend: p.backend,
+        wfa_max_edits: p.wfa_max_edits,
     };
 
     (0..ncol)
@@ -220,6 +225,7 @@ fn per_sample_cell_flags(
         gap_p: p.gap_p,
         max_shift: p.max_shift,
         backend: p.backend,
+        wfa_max_edits: p.wfa_max_edits,
     };
     let mut buf = AlignBuffers::new();
     (0..nrow)

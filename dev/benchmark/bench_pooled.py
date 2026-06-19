@@ -66,6 +66,7 @@ Run `python3 bench_pooled.py --help` for all options.
 import argparse
 import concurrent.futures
 import glob
+import json
 import os
 import re
 import subprocess
@@ -97,6 +98,39 @@ def maybe_verbose(cmd):
         return [*cmd, "--verbose"]
     return cmd
 
+
+# Set from --align-backend in main(). The dada2-rs alignment backend ("nw" or
+# "wfa2"); injected into every alignment-using subcommand so a whole-pipeline
+# A/B is one flag. R DADA2 has no such switch (always NW), so a wfa2 run is an
+# honest "R-NW vs dada2-rs-WFA" comparison.
+ALIGN_BACKEND = "nw"
+
+# Set from --wfa-max-edits in main() (or per-iteration by the cap sweep). The WFA
+# edit-budget cap (issue #51); None = leave the binary's own default. Only ever
+# injected alongside the wfa2 backend.
+WFA_MAX_EDITS = None
+
+# dada2-rs subcommands that actually align (and accept --align-backend /
+# --wfa-max-edits). Note the chimera step (remove-bimera-denovo) aligns too, on
+# its own path, so it's here.
+RS_ALIGN_SUBCMDS = {
+    "learn-errors", "dada", "dada-pooled", "dada-pseudo", "remove-bimera-denovo",
+}
+
+
+def maybe_align_backend(cmd):
+    """Append --align-backend (and --wfa-max-edits, if set) to a dada2-rs
+    alignment subcommand (keyed on cmd[1]) when a non-default backend is
+    selected. Only injected for wfa2 so default (nw) runs are byte-identical to
+    before and work with any binary; R commands and non-aligning steps (filter,
+    merge, make-table) are left untouched. The cap rides with wfa2 only — it is
+    meaningless for nw, and the binary ignores it there anyway."""
+    if ALIGN_BACKEND != "nw" and len(cmd) > 1 and str(cmd[1]) in RS_ALIGN_SUBCMDS:
+        cmd = [*cmd, "--align-backend", ALIGN_BACKEND]
+        if WFA_MAX_EDITS is not None:
+            cmd = [*cmd, "--wfa-max-edits", str(WFA_MAX_EDITS)]
+    return cmd
+
 R_STEPS = {
     "illumina": ["filter", "learn_fwd", "learn_rev", "dada_fwd", "dada_rev",
                  "merge", "make_table", "remove_bimera"],
@@ -120,7 +154,7 @@ def find_binary(explicit):
 
 def run_step(name, cmd, logf, results, append_log=False):
     """Run cmd as one process; record (name, wall_s, maxrss_kb, rc). Returns rc."""
-    cmd = maybe_verbose(cmd)
+    cmd = maybe_align_backend(maybe_verbose(cmd))
     print(f"  ==> {name}: {' '.join(str(c) for c in cmd)}", flush=True)
     start = time.time()
     with open(logf, "ab" if append_log else "wb") as lf:
@@ -150,7 +184,7 @@ def run_phase_concurrent(name, jobs, results, max_workers):
     print(f"  ==> {name}: {len(jobs)} samples, up to {max_workers} concurrent", flush=True)
 
     def one(cmd, logf):
-        cmd = maybe_verbose(cmd)
+        cmd = maybe_align_backend(maybe_verbose(cmd))
         with open(logf, "wb") as lf:
             proc = subprocess.Popen([str(c) for c in cmd],
                                     stdout=subprocess.DEVNULL, stderr=lf)
@@ -476,6 +510,143 @@ def sample_jobs_sweep(args, bin_, outdir):
     print(f"  Wrote {csv_path}")
 
 
+def load_table(nochim_json):
+    """Load a make-sequence-table / remove-bimera-denovo JSON into a dict
+    {sequence -> {sample -> count}} (per-sample, order-independent). Returns None
+    if the file is missing/unreadable."""
+    try:
+        with open(nochim_json) as fh:
+            d = json.load(fh)
+        samples, seqs, counts = d["samples"], d["sequences"], d["counts"]
+    except (OSError, ValueError, KeyError):
+        return None
+    # counts[i][j] = sample i, sequence j
+    table = {}
+    for j, seq in enumerate(seqs):
+        table[seq] = {samples[i]: counts[i][j] for i in range(len(samples))}
+    return table
+
+
+def table_equiv(a, b):
+    """Compare two {seq -> {sample -> count}} tables. Returns
+    (jaccard, exact_frac, identical) where jaccard is over the ASV sequence sets,
+    exact_frac is the fraction of shared ASVs whose full per-sample count vector
+    matches, and identical is True iff the tables are byte-equal (same ASV set
+    AND every count). None-safe: returns (None, None, None) if either is None."""
+    if a is None or b is None:
+        return (None, None, None)
+    sa, sb = set(a), set(b)
+    union = sa | sb
+    shared = sa & sb
+    jaccard = 1.0 if not union else len(shared) / len(union)
+    exact = sum(1 for s in shared if a[s] == b[s])
+    exact_frac = 1.0 if not shared else exact / len(shared)
+    identical = (sa == sb) and all(a[s] == b[s] for s in shared)
+    return (jaccard, exact_frac, identical)
+
+
+def _run_full_pipeline(args, bin_, outdir):
+    """Run the whole dada2-rs pipeline once under the current ALIGN_BACKEND /
+    WFA_MAX_EDITS globals; return (wall_s, cpu_s, peak_kb, table)."""
+    run_pipeline = rust_illumina if args.platform == "illumina" else rust_pacbio
+    res = []
+    run_pipeline(args, bin_, outdir, res)
+    rows_c = collapse(res)
+    wall = sum(r["wall_s"] for r in rows_c)
+    cpu = sum(r.get("cpu_s", 0.0) for r in rows_c)
+    peak = max((r["maxrss_kb"] for r in rows_c), default=0)
+    return wall, cpu, peak, load_table(outdir / "seqtab_nochim.json")
+
+
+def wfa_max_edits_sweep(args, bin_, outdir):
+    """Sweep the WFA edit-budget cap (--wfa-max-edits, issue #51) over the FULL
+    dada2-rs pipeline, plus an NW reference arm, reporting end-to-end wall /
+    cores / peak RSS and TABLE-LEVEL equivalence (ASV sequence set + per-sample
+    counts) against both the NW reference (backend equivalence) and the unbounded
+    WFA arm (cap correctness-neutrality).
+
+    Unlike the thread / sample-jobs sweeps this re-runs the whole pipeline per
+    arm (not just denoise): the cap also governs learn-errors, where the WFA
+    O(n·s) cost concentrates on divergent pairs, so a denoise-only sweep would
+    miss most of the effect.
+
+    Two questions in one run:
+      Q1 (cap)     — WFA(cap) vs WFA(unbounded): should be IDENTICAL (the cap
+                     only routes over-budget pairs to NW).
+      Q2 (backend) — WFA vs NW: should be ASV-equivalent (jaccard≈1, counts≈)."""
+    global ALIGN_BACKEND, WFA_MAX_EDITS
+    # 0 = unbounded; accept it as a sweep point alongside positive caps. Sort so
+    # the unbounded arm (if requested) is the canonical WFA reference.
+    sweep = [int(e) for e in args.wfa_max_edits_sweep.split(",")]
+
+    # --- NW reference arm ---
+    print("\n=== full pipeline @ NW (reference) ===", flush=True)
+    ALIGN_BACKEND, WFA_MAX_EDITS = "nw", None
+    nw_dir = outdir / "nw"
+    nw_dir.mkdir(parents=True, exist_ok=True)
+    nw_wall, nw_cpu, nw_peak, nw_tab = _run_full_pipeline(args, bin_, nw_dir)
+    rows = [{"arm": "nw", "edits": None, "wall_s": nw_wall, "cpu_s": nw_cpu,
+             "maxrss_kb": nw_peak, "cores": nw_cpu / nw_wall if nw_wall > 0 else 0.0,
+             "table": nw_tab}]
+
+    # --- WFA arms (one per cap) ---
+    ALIGN_BACKEND = "wfa2"
+    for e in sweep:
+        WFA_MAX_EDITS = e
+        label = "unbounded" if e == 0 else f"{e} edits"
+        print(f"\n=== full pipeline @ wfa2 --wfa-max-edits {e} ({label}) ===", flush=True)
+        edir = outdir / (f"e{e}")
+        edir.mkdir(parents=True, exist_ok=True)
+        wall, cpu, peak, tab = _run_full_pipeline(args, bin_, edir)
+        rows.append({"arm": "wfa2", "edits": e, "wall_s": wall, "cpu_s": cpu,
+                     "maxrss_kb": peak, "cores": cpu / wall if wall > 0 else 0.0,
+                     "table": tab})
+
+    # Canonical WFA reference for the cap-neutrality column: the unbounded arm if
+    # present, else the first WFA arm.
+    wfa_rows = [r for r in rows if r["arm"] == "wfa2"]
+    wfa_ref = next((r for r in wfa_rows if r["edits"] == 0), wfa_rows[0] if wfa_rows else None)
+
+    def nasv(r):
+        return "—" if r["table"] is None else str(len(r["table"]))
+
+    print("\n" + "=" * 92)
+    print(f"WFA-MAX-EDITS SWEEP — {args.platform} {args.pool}, {args.threads} thread(s), "
+          "full pipeline")
+    print("=" * 92)
+    print(f"  {'arm':>10}{'wall_s':>10}{'cores':>7}{'peak_rss':>11}{'n_asv':>7}"
+          f"{'jac/cnt vs NW':>15}{'≡ unbnd WFA':>13}")
+    csv_path = outdir / "sweep_wfa_edits.csv"
+    with open(csv_path, "w") as cf:
+        cf.write("arm,wfa_max_edits,wall_s,cpu_s,cores,maxrss_kb,n_asv,"
+                 "jaccard_vs_nw,count_frac_vs_nw,identical_to_unbounded_wfa\n")
+        for r in rows:
+            arm = "nw" if r["arm"] == "nw" else ("wfa unbnd" if r["edits"] == 0
+                                                 else f"wfa {r['edits']}")
+            jac, cnt, _ = table_equiv(r["table"], nw_tab)
+            vsnw = "—" if jac is None else f"{jac:.3f}/{cnt:.3f}"
+            if r["arm"] == "nw" or wfa_ref is None:
+                equ = "—"
+            else:
+                _, _, ident = table_equiv(r["table"], wfa_ref["table"])
+                equ = "—" if ident is None else ("yes" if ident else "NO")
+            print(f"  {arm:>10}{r['wall_s']:>10.2f}{r['cores']:>7.1f}"
+                  f"{fmt_rss(r['maxrss_kb']):>11}{nasv(r):>7}{vsnw:>15}{equ:>13}")
+            cf.write(f"{r['arm']},{'' if r['edits'] is None else r['edits']},"
+                     f"{r['wall_s']:.2f},{r['cpu_s']:.2f},{r['cores']:.2f},"
+                     f"{r['maxrss_kb']:.0f},{nasv(r)},"
+                     f"{'' if jac is None else f'{jac:.4f}'},"
+                     f"{'' if cnt is None else f'{cnt:.4f}'},"
+                     f"{'' if (r['arm'] == 'nw' or wfa_ref is None) else ident}\n")
+    print("\n  jac/cnt vs NW : ASV-set Jaccard / per-sample exact-count fraction vs the")
+    print("                  NW reference (backend equivalence; expect ≈1.0/≈1.0).")
+    print("  ≡ unbnd WFA   : table byte-identical to the unbounded WFA arm — the cap's")
+    print("                  correctness-neutrality. 'yes' across all caps = the default")
+    print("                  has margin (no real error-copy was truncated). A 'NO' marks")
+    print("                  the cap value where an ASV first changed.")
+    print(f"  Wrote {csv_path}")
+
+
 # --------------------------------------------------------------------------
 # R DADA2 pipeline — one Rscript process per step (symmetric per-step RSS)
 # --------------------------------------------------------------------------
@@ -676,6 +847,25 @@ def main():
                         "objects resident (~ dada2-rs --cache-samples). Use 'objects' for a "
                         "like-for-like preloaded-RSS comparison against --cache-samples; the "
                         "derepFastq cost is counted inside the dada step.")
+    p.add_argument("--align-backend", choices=["nw", "wfa2"], default="nw",
+                   help="dada2-rs pairwise-alignment backend, threaded into every "
+                        "alignment-using step (learn-errors, dada*, remove-bimera-denovo). "
+                        "'nw' (default) = Needleman-Wunsch; 'wfa2' = experimental WFA. "
+                        "R DADA2 always uses NW, so --align-backend wfa2 --run-r compares "
+                        "R-NW vs dada2-rs-WFA. Default nw leaves command lines unchanged.")
+    p.add_argument("--wfa-max-edits", type=int, default=None, metavar="N",
+                   help="dada2-rs WFA edit-budget cap (issue #51), passed to every "
+                        "alignment step when --align-backend wfa2. 0 = unbounded. "
+                        "Default: leave the binary's own default (50). Only meaningful "
+                        "with wfa2.")
+    p.add_argument("--wfa-max-edits-sweep", default=None, metavar="N,N,...",
+                   help="run the FULL pipeline once as an NW reference plus once per "
+                        "WFA cap value, reporting end-to-end wall / cores / peak RSS "
+                        "and TABLE-LEVEL equivalence (ASV set + per-sample counts) vs "
+                        "both NW (backend equivalence) and the unbounded WFA arm (cap "
+                        "correctness-neutrality). Include 0 for the unbounded WFA "
+                        "reference. Watch that '≡ unbnd WFA' stays 'yes' across caps "
+                        "while wall/peak drop. e.g. --wfa-max-edits-sweep 0,30,50,80")
     p.add_argument("--no-run-rust", action="store_true", help="skip the dada2-rs pipeline")
     p.add_argument("--verbose", action="store_true",
                    help="pass --verbose to each dada2-rs step (filter/remove-primers/"
@@ -714,8 +904,10 @@ def main():
     p.add_argument("--max-n", type=int, default=0)
     args = p.parse_args()
 
-    global VERBOSE
+    global VERBOSE, ALIGN_BACKEND, WFA_MAX_EDITS
     VERBOSE = args.verbose
+    ALIGN_BACKEND = args.align_backend
+    WFA_MAX_EDITS = args.wfa_max_edits
 
     if args.trunc_q is None:
         args.trunc_q = 2 if args.platform == "illumina" else 0
@@ -737,6 +929,13 @@ def main():
         print(f"=== sample-jobs sweep: dada2-rs ({args.platform}, {args.pool}) — {bin_} ===",
               flush=True)
         sample_jobs_sweep(args, bin_, outdir)
+        return
+
+    if args.wfa_max_edits_sweep:
+        bin_ = find_binary(args.dada2rs)
+        print(f"=== wfa-max-edits sweep: dada2-rs ({args.platform}, {args.pool}) — {bin_} ===",
+              flush=True)
+        wfa_max_edits_sweep(args, bin_, outdir)
         return
 
     rust_results, r_split_results, r_split_nasv, r_single = [], [], None, None
@@ -764,7 +963,9 @@ def main():
     if args.pool == "pseudo":
         mode += " cached" if args.cache_samples else " streaming"
     rmode = f", R derep={args.r_derep_mode}" if args.run_r else ""
-    print(f"BENCHMARK SUMMARY — {args.platform}, {mode} denoise, {args.threads} thread(s){rmode}")
+    bemode = f", dada2-rs align={args.align_backend}" if args.align_backend != "nw" else ""
+    print(f"BENCHMARK SUMMARY — {args.platform}, {mode} denoise, "
+          f"{args.threads} thread(s){bemode}{rmode}")
     print("=" * 56)
     print(f"  cores = CPU/wall (effective cores; ideal ≈ {args.threads} for an "
           "in-process step, ≈ min(#samples, threads) for fanned steps)")
