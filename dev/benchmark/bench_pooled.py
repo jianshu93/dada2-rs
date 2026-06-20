@@ -555,6 +555,15 @@ def _run_full_pipeline(args, bin_, outdir):
     wall = sum(r["wall_s"] for r in rows_c)
     cpu = sum(r.get("cpu_s", 0.0) for r in rows_c)
     peak = max((r["maxrss_kb"] for r in rows_c), default=0)
+    # Per-step breakdown for this arm (cores = cpu/wall per step) so core usage
+    # can be inspected after the fact under the default --sample-jobs, without
+    # re-running. One row per pipeline step; learn/dada are where WFA's cost
+    # concentrates (issue #51).
+    with open(outdir / "steps.csv", "w") as sf:
+        sf.write("step,wall_s,cpu_s,cores,maxrss_kb\n")
+        for r in rows_c:
+            sf.write(f"{r['step']},{r['wall_s']:.2f},{r.get('cpu_s', 0.0):.2f},"
+                     f"{cores(r):.2f},{r['maxrss_kb']:.0f}\n")
     return wall, cpu, peak, load_table(outdir / "seqtab_nochim.json")
 
 
