@@ -1,9 +1,13 @@
 # Diagnostics
 
-This page documents **experimental diagnostic tooling** built into `dada2-rs`
-for interrogating the internals of the DADA2 algorithm — currently the k-mer
-**screen** (`KDIST_CUTOFF`) and the alignment **band size** (`BAND_SIZE`), two
-constants that ship with little documented derivation.
+This page documents **experimental diagnostic tooling** built into `dada2-rs`, along with related helper scripts, for interrogating the internals of the DADA2 algorithm. 
+
+---
+
+## `kdist-calibrate`: k-mer screen, `KDIST_CUTOFF`, `BAND_SIZE`
+
+Currently the k-mer **screen** (`KDIST_CUTOFF`) and the alignment **band size** 
+(`BAND_SIZE`) are two constants that ship with set defaults or recommendations, but without much documentation on how these were derived (which data were used, the tools for calibration, etc). Some of the tooling, e.g., ESPRIT, also are no longer available online. 
 
 !!! warning "Hidden, experimental subcommand"
 
@@ -15,9 +19,8 @@ constants that ship with little documented derivation.
     conclusions, especially the small sample sizes behind the preliminary
     numbers below.
 
----
 
-## What it measures
+### What it measures
 
 DADA2 avoids most pairwise alignments with a cheap **k-mer distance screen**:
 pairs whose k-mer distance exceeds `KDIST_CUTOFF` (default **0.42**, nominally
@@ -40,7 +43,7 @@ k-mer distance and the **true unbanded alignment divergence**.
 
 ---
 
-## Invocation
+### Invocation
 
 The input is one or more **derep JSON** files (`.json` / `.json.gz`, as produced
 by the `derep` subcommand):
@@ -74,9 +77,9 @@ dada2-rs kdist-calibrate sampleA.derep.json [sampleB.derep.json ...] \
 
 ---
 
-## Modes and outputs
+### Modes and outputs
 
-### 1. All-pairs mode (default)
+#### 1. All-pairs mode (default)
 
 For sampled unique-sequence pairs, emits the k-mer distance alongside the true
 alignment divergence. CSV columns:
@@ -92,7 +95,7 @@ alignment divergence. CSV columns:
 | `screened_in` | `1` if `kdist < cutoff` (DADA2 would align this pair). |
 | `ab_i`, `ab_j` | The two sequence abundances. |
 
-### 2. Abundance-aware mode (`--nearest-parent`)
+#### 2. Abundance-aware mode (`--nearest-parent`)
 
 For each unique, links it to its nearest **more-abundant** neighbour — its
 candidate error-copy "parent", mirroring DADA2's greedy center-based comparison
@@ -112,7 +115,7 @@ This mode is also far cheaper — O(n²) *cheap* k-mer comparisons to find each
 parent plus only O(n) alignments (vs O(n²) alignments in all-pairs mode) — so it
 scales to pooled/multisample inputs much better.
 
-### `--verbose` summaries (stderr)
+#### `--verbose` summaries (stderr)
 
 `--verbose` adds per-population summary lines that are usually what you want
 before touching the CSV:
@@ -147,7 +150,7 @@ before touching the CSV:
 
 ---
 
-## Processing the CSV
+### Processing the CSV
 
 The CSV is deliberately raw, one row per pair, so any tabular tool works. A
 common first cut — the k-mer-distance ↔ divergence calibration curve — bins by
@@ -181,7 +184,7 @@ print("band needed for error copies:", ec.band_req.max())
 
 ---
 
-## Preliminary outcomes
+### Preliminary outcomes
 
 !!! danger "Preliminary — tiny datasets"
 
@@ -190,7 +193,7 @@ print("band needed for error copies:", ec.band_req.max())
     result the tool produces; they are **not** a basis for retuning any default.
     See [caveats](#caveats).
 
-### The screen cutoff (`KDIST_CUTOFF = 0.42`)
+#### The screen cutoff (`KDIST_CUTOFF = 0.42`)
 
 On an Illumina V4 sample (sam1F, 240 bp, k=5):
 
@@ -205,7 +208,7 @@ On an Illumina V4 sample (sam1F, 240 bp, k=5):
 is screened in) but **measurably looser** than its documented calibration, and
 ~55% of screened-in pairs are too divergent to be error copies (pure leakage).
 
-### Screen saturation on long reads
+#### Screen saturation on long reads
 
 The k-mer distance is `1 − shared/(L−k+1)`. When sequence length `L` ≫ `4ᵏ`,
 every sequence contains nearly the whole k-mer vocabulary, so even very
@@ -228,7 +231,7 @@ near its intended ~10%.
     These measurements are the mechanistic basis for our PacBio `k = 7`
     recommendation.
 
-### Screen headroom (abundance-aware)
+#### Screen headroom (abundance-aware)
 
 | sample (k) | error-copy kdist ceiling | headroom below 0.42 |
 |---|---|---|
@@ -240,7 +243,7 @@ Illumina). On these samples the cutoff could be roughly **3× tighter** and stil
 capture every clear error copy — though that figure is a per-sample *lower
 bound*, not a safe global value.
 
-### Band size
+#### Band size
 
 `band_req` is the minimum band that reproduces a pair's true alignment:
 
@@ -258,7 +261,7 @@ looks like a single worst-case constant applied uniformly.
 
 ---
 
-## Caveats
+#### Caveats!
 
 !!! danger "Read before using these numbers"
 
