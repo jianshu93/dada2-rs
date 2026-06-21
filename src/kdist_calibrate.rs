@@ -59,10 +59,14 @@ fn encode(seq: &str) -> Vec<u8> {
         .collect()
 }
 
-/// Internal edit divergence of an ends-free alignment: trim terminal gap
-/// overhang (length difference, not divergence), then count substitution and
-/// indel columns in the aligned core. Returns (edits, core_len).
-fn aln_divergence(a: &[u8], b: &[u8]) -> (usize, usize) {
+/// Stats of an ends-free alignment. Returns (edits, core_len, band_req):
+/// - edits/core_len: substitution+indel columns over the aligned core (terminal
+///   gap overhang trimmed — that's length difference, not divergence).
+/// - band_req: the MINIMUM diagonal band that would reproduce this alignment =
+///   max over the path of |#seq1-bases − #seq2-bases consumed so far|. A banded
+///   aligner with band < band_req cannot find this alignment (it gets truncated
+///   to a worse score), so band_req is the cost of correctly aligning the pair.
+fn aln_divergence(a: &[u8], b: &[u8]) -> (usize, usize, usize) {
     let n = a.len();
     let mut lo = 0;
     while lo < n && (a[lo] == GAP || b[lo] == GAP) {
@@ -72,13 +76,25 @@ fn aln_divergence(a: &[u8], b: &[u8]) -> (usize, usize) {
     while hi > lo && (a[hi - 1] == GAP || b[hi - 1] == GAP) {
         hi -= 1;
     }
+    // band_req over the full path (the band applies to the whole DP matrix):
+    // a gap in seq2 advances only seq1 (offset +1); a gap in seq1, only seq2
+    // (offset -1); a match/mismatch advances both (no change).
+    let (mut off, mut band_req) = (0i32, 0i32);
+    for k in 0..n {
+        if b[k] == GAP {
+            off += 1;
+        } else if a[k] == GAP {
+            off -= 1;
+        }
+        band_req = band_req.max(off.abs());
+    }
     let mut edits = 0;
     for k in lo..hi {
         if a[k] == GAP || b[k] == GAP || a[k] != b[k] {
             edits += 1;
         }
     }
-    (edits, hi - lo)
+    (edits, hi - lo, band_req as usize)
 }
 
 /// One sample's uniques: encoded sequences, abundances, and k-mer screens.
@@ -238,9 +254,11 @@ fn pairs_mode(
 ) -> io::Result<()> {
     writeln!(
         w,
-        "sample,kdist,edits,core_len,pct_div,screened_in,ab_i,ab_j"
+        "sample,kdist,edits,core_len,pct_div,band_req,screened_in,ab_i,ab_j"
     )?;
     let (mut tot, mut scr, mut leak) = (0u64, 0u64, 0u64);
+    let mut band_all: Vec<usize> = Vec::new();
+    let mut band_scr: Vec<usize> = Vec::new();
     for (pi, s) in pops.iter().enumerate() {
         let n = s.enc.len();
         let seed = p.seed.wrapping_add(pi as u64).wrapping_mul(0x100000001B3);
@@ -256,7 +274,7 @@ fn pairs_mode(
                 p.threads,
             );
         }
-        let rows: Vec<(f64, usize, usize, f64, bool)> = pool.install(|| {
+        let rows: Vec<(f64, usize, usize, f64, usize, bool)> = pool.install(|| {
             pairs
                 .par_iter()
                 .map_init(AlignBuffers::new, |buf, &(i, j)| {
@@ -268,28 +286,30 @@ fn pairs_mode(
                         p.k,
                     );
                     align_endsfree_with_buf(&s.enc[i], &s.enc[j], 5, -4, -8, p.band, buf);
-                    let (edits, core) = aln_divergence(&buf.al0, &buf.al1);
+                    let (edits, core, band_req) = aln_divergence(&buf.al0, &buf.al1);
                     let pct = if core > 0 {
                         100.0 * edits as f64 / core as f64
                     } else {
                         0.0
                     };
-                    (kd, edits, core, pct, kd < p.cutoff)
+                    (kd, edits, core, pct, band_req, kd < p.cutoff)
                 })
                 .collect()
         });
-        for (idx, &(kd, edits, core, pct, sin)) in rows.iter().enumerate() {
+        for (idx, &(kd, edits, core, pct, band_req, sin)) in rows.iter().enumerate() {
             let (i, j) = pairs[idx];
             tot += 1;
+            band_all.push(band_req);
             if sin {
                 scr += 1;
+                band_scr.push(band_req);
                 if pct > p.leak_pct {
                     leak += 1;
                 }
             }
             writeln!(
                 w,
-                "{},{kd:.4},{edits},{core},{pct:.3},{},{},{}",
+                "{},{kd:.4},{edits},{core},{pct:.3},{band_req},{},{},{}",
                 s.name, sin as u8, s.counts[i], s.counts[j]
             )?;
         }
@@ -301,8 +321,32 @@ fn pairs_mode(
             100.0 * scr as f64 / tot as f64,
             p.leak_pct,
         );
+        eprintln!("[kdist] {}", band_fit("all pairs", &band_all));
+        eprintln!("[kdist] {}", band_fit("screened-in", &band_scr));
     }
     Ok(())
+}
+
+/// Candidate band sizes for the band-fit summary (DADA2 default is 16).
+const BAND_SWEEP: [usize; 7] = [2, 4, 8, 16, 32, 64, 128];
+
+/// For each candidate band B, the fraction of alignments whose true path fits
+/// within B (band_req <= B) — i.e. that a banded aligner at B would compute
+/// correctly. The complement is distorted/effectively-rejected by that band.
+fn band_fit(label: &str, band_reqs: &[usize]) -> String {
+    let n = band_reqs.len();
+    if n == 0 {
+        return format!("{label} band-fit: (none)");
+    }
+    let parts: Vec<String> = BAND_SWEEP
+        .iter()
+        .map(|&b| {
+            let f = band_reqs.iter().filter(|&&r| r <= b).count();
+            format!("≤{b}:{:.1}%", 100.0 * f as f64 / n as f64)
+        })
+        .collect();
+    let mx = band_reqs.iter().copied().max().unwrap_or(0);
+    format!("{label} band-fit ({n}, max_req {mx}): {}", parts.join(" "))
 }
 
 /// Divergence below which a nearest-parent link is treated as a clear
@@ -322,7 +366,7 @@ fn nearest_parent_mode(
 ) -> io::Result<()> {
     writeln!(
         w,
-        "sample,ab,parent_ab,ab_ratio,kdist,edits,core_len,pct_div,screened_in"
+        "sample,ab,parent_ab,ab_ratio,kdist,edits,core_len,pct_div,band_req,screened_in"
     )?;
     for s in pops {
         let n = s.enc.len();
@@ -337,7 +381,7 @@ fn nearest_parent_mode(
         }
         // For each non-top unique (position r), scan the more-abundant prefix
         // order[0..r] for the min-kdist parent, then align that pair.
-        let rows: Vec<(usize, usize, f64, usize, usize, f64)> = pool.install(|| {
+        let rows: Vec<(usize, usize, f64, usize, usize, f64, usize)> = pool.install(|| {
             (1..n)
                 .into_par_iter()
                 .map_init(AlignBuffers::new, |buf, r| {
@@ -357,13 +401,13 @@ fn nearest_parent_mode(
                         }
                     }
                     align_endsfree_with_buf(&s.enc[i], &s.enc[parent], 5, -4, -8, p.band, buf);
-                    let (edits, core) = aln_divergence(&buf.al0, &buf.al1);
+                    let (edits, core, band_req) = aln_divergence(&buf.al0, &buf.al1);
                     let pct = if core > 0 {
                         100.0 * edits as f64 / core as f64
                     } else {
                         0.0
                     };
-                    (i, parent, best_kd, edits, core, pct)
+                    (i, parent, best_kd, edits, core, pct, band_req)
                 })
                 .collect()
         });
@@ -372,19 +416,21 @@ fn nearest_parent_mode(
         let (mut linked, mut total) = (0u64, 0u64);
         let mut ceiling = 0.0f64;
         let mut kds: Vec<f64> = Vec::with_capacity(rows.len());
-        for &(i, parent, kd, edits, core, pct) in &rows {
+        let mut band_ec: Vec<usize> = Vec::new(); // band_req of clear error-copy links
+        for &(i, parent, kd, edits, core, pct, band_req) in &rows {
             total += 1;
             if kd < p.cutoff {
                 linked += 1;
             }
             if pct <= CLEAR_ERROR_COPY_PCT {
                 ceiling = ceiling.max(kd);
+                band_ec.push(band_req);
             }
             kds.push(kd);
             let ratio = s.counts[parent] as f64 / s.counts[i].max(1) as f64;
             writeln!(
                 w,
-                "{},{},{},{ratio:.2},{kd:.4},{edits},{core},{pct:.3},{}",
+                "{},{},{},{ratio:.2},{kd:.4},{edits},{core},{pct:.3},{band_req},{}",
                 s.name,
                 s.counts[i],
                 s.counts[parent],
@@ -404,6 +450,11 @@ fn nearest_parent_mode(
                 p.cutoff,
                 ceiling,
                 p.cutoff - ceiling,
+            );
+            eprintln!(
+                "[kdist] {} : {}",
+                s.name,
+                band_fit("clear-error-copy", &band_ec)
             );
         }
     }
