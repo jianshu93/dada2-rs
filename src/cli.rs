@@ -2117,6 +2117,14 @@ pub enum Commands {
         #[arg(long)]
         per_sample: bool,
 
+        /// Abundance-aware mode: instead of random pairs, link each unique to
+        /// its nearest MORE-abundant neighbour (candidate error-copy parent) and
+        /// report the screen's headroom above the real error-copy distances.
+        /// Output columns change to sample,ab,parent_ab,ab_ratio,kdist,edits,
+        /// core_len,pct_div,screened_in.
+        #[arg(long)]
+        nearest_parent: bool,
+
         /// Threads for the parallel alignment
         #[arg(long, default_value_t = 1)]
         threads: usize,

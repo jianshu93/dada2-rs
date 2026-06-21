@@ -40,6 +40,7 @@ pub struct Params {
     pub max_pairs: usize,
     pub max_uniques: usize,
     pub per_sample: bool,
+    pub nearest_parent: bool,
     pub threads: usize,
     pub seed: u64,
     pub output: Option<PathBuf>,
@@ -214,16 +215,31 @@ pub fn run(inputs: &[PathBuf], p: &Params) -> io::Result<()> {
         Some(path) => Box::new(BufWriter::new(File::create(path).with_path(path)?)),
         None => Box::new(BufWriter::new(io::stdout())),
     };
-    writeln!(
-        w,
-        "sample,kdist,edits,core_len,pct_div,screened_in,ab_i,ab_j"
-    )?;
-
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(p.threads)
         .build()
         .map_err(io::Error::other)?;
 
+    if p.nearest_parent {
+        nearest_parent_mode(&mut *w, &pool, &pops, p)?;
+    } else {
+        pairs_mode(&mut *w, &pool, &pops, p)?;
+    }
+    w.flush()?;
+    Ok(())
+}
+
+/// All-pairs (random-subsampled) mode: kdist vs divergence over sampled pairs.
+fn pairs_mode(
+    w: &mut dyn Write,
+    pool: &rayon::ThreadPool,
+    pops: &[Sample],
+    p: &Params,
+) -> io::Result<()> {
+    writeln!(
+        w,
+        "sample,kdist,edits,core_len,pct_div,screened_in,ab_i,ab_j"
+    )?;
     let (mut tot, mut scr, mut leak) = (0u64, 0u64, 0u64);
     for (pi, s) in pops.iter().enumerate() {
         let n = s.enc.len();
@@ -240,8 +256,6 @@ pub fn run(inputs: &[PathBuf], p: &Params) -> io::Result<()> {
                 p.threads,
             );
         }
-        // Parallel per-pair: kdist (cheap) + unbanded NW (the cost). Per-thread
-        // AlignBuffers reuse via map_init.
         let rows: Vec<(f64, usize, usize, f64, bool)> = pool.install(|| {
             pairs
                 .par_iter()
@@ -280,15 +294,118 @@ pub fn run(inputs: &[PathBuf], p: &Params) -> io::Result<()> {
             )?;
         }
     }
-    w.flush()?;
     if p.verbose && tot > 0 {
         eprintln!(
-            "[kdist] {tot} pairs: screened-in (kdist<{}) {scr} ({:.1}%); of those {leak} are \
-             >{}% divergent (leakage)",
+            "[kdist] {tot} pairs: screened-in (kdist<{}) {scr} ({:.1}%); of those {leak} are >{}% divergent (leakage)",
             p.cutoff,
             100.0 * scr as f64 / tot as f64,
             p.leak_pct,
         );
+    }
+    Ok(())
+}
+
+/// Divergence below which a nearest-parent link is treated as a clear
+/// error-copy candidate when computing the screen "headroom".
+const CLEAR_ERROR_COPY_PCT: f64 = 3.0;
+
+/// Abundance-aware mode: for each unique, find its nearest MORE-abundant
+/// neighbour (its candidate error-copy "parent", mirroring DADA2's greedy
+/// center-based comparison) by k-mer distance, then align that one pair for the
+/// true divergence. The distribution of parent-link kdist is the empirical
+/// error-copy distance ceiling; `cutoff − ceiling` is the screen's headroom.
+fn nearest_parent_mode(
+    w: &mut dyn Write,
+    pool: &rayon::ThreadPool,
+    pops: &[Sample],
+    p: &Params,
+) -> io::Result<()> {
+    writeln!(
+        w,
+        "sample,ab,parent_ab,ab_ratio,kdist,edits,core_len,pct_div,screened_in"
+    )?;
+    for s in pops {
+        let n = s.enc.len();
+        // abundance-descending order (stable by index for ties)
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&a, &b| s.counts[b].cmp(&s.counts[a]).then(a.cmp(&b)));
+        if p.verbose {
+            eprintln!(
+                "[kdist] {} : {n} uniques, nearest more-abundant parent each (k={}, band={}, {} threads)",
+                s.name, p.k, p.band, p.threads,
+            );
+        }
+        // For each non-top unique (position r), scan the more-abundant prefix
+        // order[0..r] for the min-kdist parent, then align that pair.
+        let rows: Vec<(usize, usize, f64, usize, usize, f64)> = pool.install(|| {
+            (1..n)
+                .into_par_iter()
+                .map_init(AlignBuffers::new, |buf, r| {
+                    let i = order[r];
+                    let (mut best_kd, mut parent) = (f64::INFINITY, order[0]);
+                    for &c in &order[0..r] {
+                        let kd = kmer_dist8(
+                            &s.kmers[i],
+                            s.enc[i].len(),
+                            &s.kmers[c],
+                            s.enc[c].len(),
+                            p.k,
+                        );
+                        if kd < best_kd {
+                            best_kd = kd;
+                            parent = c;
+                        }
+                    }
+                    align_endsfree_with_buf(&s.enc[i], &s.enc[parent], 5, -4, -8, p.band, buf);
+                    let (edits, core) = aln_divergence(&buf.al0, &buf.al1);
+                    let pct = if core > 0 {
+                        100.0 * edits as f64 / core as f64
+                    } else {
+                        0.0
+                    };
+                    (i, parent, best_kd, edits, core, pct)
+                })
+                .collect()
+        });
+        // Headroom: among clear error-copy links (<= CLEAR_ERROR_COPY_PCT
+        // divergence) the max kdist is the ceiling the cutoff must cover.
+        let (mut linked, mut total) = (0u64, 0u64);
+        let mut ceiling = 0.0f64;
+        let mut kds: Vec<f64> = Vec::with_capacity(rows.len());
+        for &(i, parent, kd, edits, core, pct) in &rows {
+            total += 1;
+            if kd < p.cutoff {
+                linked += 1;
+            }
+            if pct <= CLEAR_ERROR_COPY_PCT {
+                ceiling = ceiling.max(kd);
+            }
+            kds.push(kd);
+            let ratio = s.counts[parent] as f64 / s.counts[i].max(1) as f64;
+            writeln!(
+                w,
+                "{},{},{},{ratio:.2},{kd:.4},{edits},{core},{pct:.3},{}",
+                s.name,
+                s.counts[i],
+                s.counts[parent],
+                (kd < p.cutoff) as u8
+            )?;
+        }
+        if p.verbose && total > 0 {
+            kds.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let p90 = kds[(kds.len() * 9 / 10).min(kds.len() - 1)];
+            eprintln!(
+                "[kdist] {} : {total} children | nearest-parent kdist median {:.3} p90 {:.3} | \
+                 {linked} ({:.1}%) within cutoff {} | clear-error-copy ceiling {:.3} -> headroom {:.3}",
+                s.name,
+                kds[kds.len() / 2],
+                p90,
+                100.0 * linked as f64 / total as f64,
+                p.cutoff,
+                ceiling,
+                p.cutoff - ceiling,
+            );
+        }
     }
     Ok(())
 }
