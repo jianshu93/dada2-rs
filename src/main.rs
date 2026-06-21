@@ -19,7 +19,6 @@ mod error_models;
 mod evaluate;
 mod filter;
 mod filter_trim;
-#[cfg(test)]
 mod kdist_calibrate;
 mod kmers;
 mod learn_errors;
@@ -3427,6 +3426,38 @@ fn main() -> io::Result<()> {
                 Some(path) => std::fs::write(&path, &json)?,
                 None => println!("{json}"),
             }
+        }
+
+        Commands::KdistCalibrate {
+            inputs,
+            k,
+            cutoff,
+            leak_pct,
+            band,
+            max_pairs,
+            max_uniques,
+            per_sample,
+            threads,
+            seed,
+            output,
+            verbose,
+        } => {
+            kdist_calibrate::run(
+                &inputs,
+                &kdist_calibrate::Params {
+                    k,
+                    cutoff,
+                    leak_pct,
+                    band,
+                    max_pairs,
+                    max_uniques,
+                    per_sample,
+                    threads,
+                    seed,
+                    output,
+                    verbose,
+                },
+            )?;
         }
     }
 

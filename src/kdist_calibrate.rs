@@ -1,227 +1,294 @@
-//! k-mer-distance vs true-divergence calibration (analysis-only, issue: KDIST_CUTOFF study).
+//! k-mer-distance vs true-divergence calibration (hidden `kdist-calibrate` subcommand).
 //!
 //! DADA2's k-mer screen skips alignment for pairs with k-mer distance above
-//! `KDIST_CUTOFF = 0.42`, said to correspond to ~10% nucleotide divergence —
-//! a value calibrated on Illumina 16S (k-mer distance traces to ESPRIT, Sun et
-//! al. 2009; the 0.42/10% calibration to DADA2, Callahan et al. 2016). The
-//! ESPRIT reference implementation is no longer available, so this re-derives
-//! the kdist <-> true-divergence relationship empirically on real input data:
-//! for a sampled set of unique-sequence pairs it emits both the k-mer distance
-//! (`kmer_dist8`, our faithful port of the ESPRIT metric) and the alignment
-//! (`align_endsfree`) edit divergence, so the constant can be checked per
-//! dataset / platform / pooling regime.
+//! `KDIST_CUTOFF = 0.42` (nominally ~10% nucleotide divergence, calibrated on
+//! Illumina 16S). The k-mer distance traces to ESPRIT (Sun et al. 2009, whose
+//! reference implementation is gone); the 0.42/10% calibration to DADA2
+//! (Callahan et al. 2016). This re-derives the relationship empirically on real
+//! data: for sampled unique-sequence pairs it emits the k-mer distance
+//! (`kmer_dist8`, our port of the ESPRIT metric) alongside the true UNBANDED
+//! `align_endsfree` divergence, so the constant can be checked per dataset /
+//! platform / k / pooling regime.
 //!
-//! POOLING: the pair *population* the screen sees depends on pooling mode —
-//! per-sample (one derep JSON) vs full-pool (a pooled seqtab / concatenated
-//! uniques). This tool computes pairs over whatever sequence set it is given,
-//! so feed it a single-sample derep for per-sample, or a pooled table for
-//! pooled; pseudo's screen population is per-sample (priors change the
-//! partition, not which pairs are screened).
+//! Alignment is unbanded by default (`--band -1`): the curve must measure the
+//! true divergence of distant pairs, which a band would truncate. It is the
+//! expensive part, so it is parallelised across `--threads`.
 //!
-//! Run (ignored; needs an input JSON):
-//!   DADA2RS_KDIST_INPUT=derep.json DADA2RS_KDIST_OUT=kdist.csv \
-//!     cargo test --release --bins kdist_calibrate -- --ignored --nocapture
-//! Env: DADA2RS_KDIST_K (default 5, = DADA2 default), DADA2RS_KDIST_MAXPAIRS
-//! (default 200000; random-subsample above this to bound the O(n^2) blow-up),
-//! DADA2RS_KDIST_CUTOFF (default 0.42, for the screened-in flag/summary).
+//! POOLING: with multiple derep JSONs, `--per-sample` computes pairs WITHIN each
+//! sample (the per-sample / independent regime); the default pools all uniques
+//! into one set and computes pairs across the union (the full-pool regime).
+//! Pseudo's screen population is per-sample (priors change the partition, not
+//! which pairs are screened), so model it with `--per-sample`.
 
-#[cfg(test)]
-mod tests {
-    use crate::kmers::{assign_kmer8, kmer_dist8};
-    use crate::nwalign::align_endsfree;
-    use std::io::Write;
+use crate::kmers::{assign_kmer8, kmer_dist8};
+use crate::misc::WithPath as _;
+use crate::nwalign::{AlignBuffers, align_endsfree_with_buf};
+use flate2::read::MultiGzDecoder;
+use rayon::prelude::*;
+use std::fs::File;
+use std::io::{self, BufWriter, Read, Write};
+use std::path::{Path, PathBuf};
 
-    const GAP: u8 = b'-';
+const GAP: u8 = b'-';
 
-    fn encode(seq: &str) -> Vec<u8> {
-        seq.bytes()
-            .map(|b| match b {
-                b'A' | b'a' => 1,
-                b'C' | b'c' => 2,
-                b'G' | b'g' => 3,
-                b'T' | b't' => 4,
-                _ => 5, // N etc. — never matches, never a valid k-mer
-            })
-            .collect()
+/// Parameters for [`run`] (mirrors the CLI flags).
+pub struct Params {
+    pub k: usize,
+    pub cutoff: f64,
+    pub leak_pct: f64,
+    pub band: i32,
+    pub max_pairs: usize,
+    pub max_uniques: usize,
+    pub per_sample: bool,
+    pub threads: usize,
+    pub seed: u64,
+    pub output: Option<PathBuf>,
+    pub verbose: bool,
+}
+
+fn encode(seq: &str) -> Vec<u8> {
+    seq.bytes()
+        .map(|b| match b {
+            b'A' | b'a' => 1,
+            b'C' | b'c' => 2,
+            b'G' | b'g' => 3,
+            b'T' | b't' => 4,
+            _ => 5, // N etc. — never a valid k-mer, never matches
+        })
+        .collect()
+}
+
+/// Internal edit divergence of an ends-free alignment: trim terminal gap
+/// overhang (length difference, not divergence), then count substitution and
+/// indel columns in the aligned core. Returns (edits, core_len).
+fn aln_divergence(a: &[u8], b: &[u8]) -> (usize, usize) {
+    let n = a.len();
+    let mut lo = 0;
+    while lo < n && (a[lo] == GAP || b[lo] == GAP) {
+        lo += 1;
     }
-
-    /// Internal edit divergence of an ends-free alignment: trim terminal gap
-    /// overhang (length difference, not divergence), then count substitutions
-    /// and indel columns in the aligned core. Returns (edits, core_len).
-    fn aln_divergence(al: &[Vec<u8>; 2]) -> (usize, usize) {
-        let (a, b) = (&al[0], &al[1]);
-        let n = a.len();
-        let mut lo = 0;
-        while lo < n && (a[lo] == GAP || b[lo] == GAP) {
-            lo += 1;
-        }
-        let mut hi = n;
-        while hi > lo && (a[hi - 1] == GAP || b[hi - 1] == GAP) {
-            hi -= 1;
-        }
-        let mut edits = 0;
-        for k in lo..hi {
-            if a[k] == GAP || b[k] == GAP {
-                edits += 1; // internal indel column
-            } else if a[k] != b[k] {
-                edits += 1; // substitution
-            }
-        }
-        (edits, hi - lo)
+    let mut hi = n;
+    while hi > lo && (a[hi - 1] == GAP || b[hi - 1] == GAP) {
+        hi -= 1;
     }
-
-    /// Parse unique sequences from either a derep JSON (`uniques[].sequence` +
-    /// `count`) or a seqtab JSON (`sequences[]`, abundance summed over samples).
-    fn load_sequences(path: &str) -> Vec<(String, u64)> {
-        let txt = std::fs::read_to_string(path).expect("read input JSON");
-        let v: serde_json::Value = serde_json::from_str(&txt).expect("parse JSON");
-        if let Some(uniques) = v.get("uniques").and_then(|u| u.as_array()) {
-            return uniques
-                .iter()
-                .filter_map(|e| {
-                    let s = e.get("sequence")?.as_str()?.to_string();
-                    let c = e.get("count").and_then(|c| c.as_u64()).unwrap_or(1);
-                    Some((s, c))
-                })
-                .collect();
+    let mut edits = 0;
+    for k in lo..hi {
+        if a[k] == GAP || b[k] == GAP || a[k] != b[k] {
+            edits += 1;
         }
-        if let Some(seqs) = v.get("sequences").and_then(|s| s.as_array()) {
-            let counts = v.get("counts").and_then(|c| c.as_array());
-            return seqs
-                .iter()
-                .enumerate()
-                .filter_map(|(j, s)| {
-                    let seq = s.as_str()?.to_string();
-                    let total = counts
-                        .map(|rows| {
-                            rows.iter()
-                                .filter_map(|r| r.as_array()?.get(j)?.as_u64())
-                                .sum::<u64>()
-                        })
-                        .unwrap_or(1);
-                    Some((seq, total))
-                })
-                .collect();
-        }
-        panic!("input has neither `uniques` (derep) nor `sequences` (seqtab)");
     }
+    (edits, hi - lo)
+}
 
-    #[test]
-    #[ignore]
-    fn kdist_calibrate() {
-        let input = match std::env::var("DADA2RS_KDIST_INPUT") {
-            Ok(p) => p,
-            Err(_) => {
-                eprintln!("set DADA2RS_KDIST_INPUT=derep_or_seqtab.json");
-                return;
-            }
-        };
-        let k: usize = std::env::var("DADA2RS_KDIST_K")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(5);
-        let max_pairs: usize = std::env::var("DADA2RS_KDIST_MAXPAIRS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(200_000);
-        let cutoff: f64 = std::env::var("DADA2RS_KDIST_CUTOFF")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0.42);
-        // A screened-in pair this divergent is too far to be an amplicon-error
-        // copy, so its alignment is "leaked" work. Crude (the true ceiling is
-        // abundance-dependent); tune via env.
-        let leak_pct: f64 = std::env::var("DADA2RS_KDIST_LEAK_PCT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(5.0);
-        let out = std::env::var("DADA2RS_KDIST_OUT").unwrap_or_else(|_| "kdist.csv".into());
+/// One sample's uniques: encoded sequences, abundances, and k-mer screens.
+struct Sample {
+    name: String,
+    enc: Vec<Vec<u8>>,
+    counts: Vec<u64>,
+    kmers: Vec<Vec<u8>>,
+}
 
-        let seqs = load_sequences(&input);
-        let n = seqs.len();
-        let enc: Vec<Vec<u8>> = seqs.iter().map(|(s, _)| encode(s)).collect();
-        let kmers: Vec<Vec<u8>> = enc.iter().map(|e| assign_kmer8(e, k)).collect();
-        let total_pairs = n * (n - 1) / 2;
-        eprintln!(
-            "{n} uniques, {total_pairs} pairs (k={k}, cutoff={cutoff}); \
-             {}",
-            if total_pairs > max_pairs {
-                format!("random-sampling {max_pairs}")
-            } else {
-                "all pairs".into()
-            }
-        );
-
-        let mut f = std::io::BufWriter::new(std::fs::File::create(&out).expect("create out"));
-        writeln!(f, "kdist,edits,core_len,pct_div,screened_in,ab_i,ab_j").unwrap();
-
-        // simple LCG for reproducible subsampling
-        let mut st: u64 = 0x9E37_79B9_7F4A_7C15;
-        let mut rnd = |m: usize| {
+/// Load a derep JSON (`uniques[].sequence` + `count`), gzip-transparent. Only
+/// derep JSONs are accepted (the screen operates on per-sample uniques).
+fn load_derep(path: &Path, k: usize, max_uniques: usize, seed: u64) -> io::Result<Sample> {
+    let f = File::open(path).with_path(path)?;
+    let mut txt = String::new();
+    if path.extension().and_then(|e| e.to_str()) == Some("gz") {
+        MultiGzDecoder::new(f).read_to_string(&mut txt)?;
+    } else {
+        io::BufReader::new(f).read_to_string(&mut txt)?;
+    }
+    let v: serde_json::Value =
+        serde_json::from_str(&txt).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let uniques = v.get("uniques").and_then(|u| u.as_array()).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{}: not a derep JSON (no `uniques`)", path.display()),
+        )
+    })?;
+    let name = v
+        .get("sample")
+        .and_then(|s| s.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("?")
+                .to_string()
+        });
+    let mut seqs: Vec<(Vec<u8>, u64)> = uniques
+        .iter()
+        .filter_map(|e| {
+            let s = e.get("sequence")?.as_str()?;
+            let c = e.get("count").and_then(|c| c.as_u64()).unwrap_or(1);
+            Some((encode(s), c))
+        })
+        .collect();
+    // Optional per-sample subsample of uniques to bound the O(n^2) pair count.
+    // Random (not abundance-top) keeps the divergence distribution unbiased.
+    if max_uniques > 0 && seqs.len() > max_uniques {
+        let mut st = seed ^ (seqs.len() as u64).wrapping_mul(0x9E37_79B9);
+        // partial Fisher–Yates: move `max_uniques` random picks to the front.
+        for i in 0..max_uniques {
             st = st.wrapping_mul(6364136223846793005).wrapping_add(1);
-            ((st >> 33) as usize) % m
-        };
+            let j = i + ((st >> 33) as usize) % (seqs.len() - i);
+            seqs.swap(i, j);
+        }
+        seqs.truncate(max_uniques);
+    }
+    let (enc, counts): (Vec<_>, Vec<_>) = seqs.into_iter().unzip();
+    let kmers = enc.iter().map(|e| assign_kmer8(e, k)).collect();
+    Ok(Sample {
+        name,
+        enc,
+        counts,
+        kmers,
+    })
+}
 
-        let (mut emitted, mut screened_in, mut leak) = (0u64, 0u64, 0u64);
-        let sample = total_pairs > max_pairs;
-        let mut do_pair = |i: usize,
-                           j: usize,
-                           f: &mut std::io::BufWriter<std::fs::File>,
-                           emitted: &mut u64,
-                           screened_in: &mut u64,
-                           leak: &mut u64| {
-            let kd = kmer_dist8(&kmers[i], enc[i].len(), &kmers[j], enc[j].len(), k);
-            let al = align_endsfree(&enc[i], &enc[j], 5, -4, -8, -1);
-            let (edits, core) = aln_divergence(&al);
-            let pct = if core > 0 {
-                100.0 * edits as f64 / core as f64
-            } else {
-                0.0
-            };
-            let scr = kd < cutoff;
-            if scr {
-                *screened_in += 1;
-                if pct > leak_pct {
-                    *leak += 1; // screened-in but too divergent to be an error copy
+/// Build the (i, j) pair list for a population of `n` uniques: enumerate all if
+/// `n*(n-1)/2 <= max_pairs`, else draw `max_pairs` random pairs (with possible
+/// repeats — fine for a calibration scatter).
+fn pairs_for(n: usize, max_pairs: usize, seed: u64) -> Vec<(usize, usize)> {
+    let total = n.saturating_mul(n.saturating_sub(1)) / 2;
+    if n < 2 {
+        return Vec::new();
+    }
+    if total <= max_pairs {
+        let mut v = Vec::with_capacity(total);
+        for i in 0..n {
+            for j in (i + 1)..n {
+                v.push((i, j));
+            }
+        }
+        return v;
+    }
+    let mut st = seed;
+    let mut rnd = |m: usize| {
+        st = st.wrapping_mul(6364136223846793005).wrapping_add(1);
+        ((st >> 33) as usize) % m
+    };
+    (0..max_pairs)
+        .map(|_| {
+            let i = rnd(n);
+            let mut j = rnd(n);
+            if i == j {
+                j = (j + 1) % n;
+            }
+            (i.min(j), i.max(j))
+        })
+        .collect()
+}
+
+pub fn run(inputs: &[PathBuf], p: &Params) -> io::Result<()> {
+    if inputs.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "no input derep JSON(s) given",
+        ));
+    }
+    let loaded: Vec<Sample> = inputs
+        .iter()
+        .map(|path| load_derep(path, p.k, p.max_uniques, p.seed))
+        .collect::<io::Result<_>>()?;
+
+    // Form populations: one per sample (per-sample) or a single merged pool.
+    let pops: Vec<Sample> = if p.per_sample {
+        loaded
+    } else {
+        let mut pool = Sample {
+            name: "pool".into(),
+            enc: Vec::new(),
+            counts: Vec::new(),
+            kmers: Vec::new(),
+        };
+        for s in loaded {
+            pool.enc.extend(s.enc);
+            pool.counts.extend(s.counts);
+            pool.kmers.extend(s.kmers);
+        }
+        vec![pool]
+    };
+
+    let mut w: Box<dyn Write> = match &p.output {
+        Some(path) => Box::new(BufWriter::new(File::create(path).with_path(path)?)),
+        None => Box::new(BufWriter::new(io::stdout())),
+    };
+    writeln!(
+        w,
+        "sample,kdist,edits,core_len,pct_div,screened_in,ab_i,ab_j"
+    )?;
+
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(p.threads)
+        .build()
+        .map_err(io::Error::other)?;
+
+    let (mut tot, mut scr, mut leak) = (0u64, 0u64, 0u64);
+    for (pi, s) in pops.iter().enumerate() {
+        let n = s.enc.len();
+        let seed = p.seed.wrapping_add(pi as u64).wrapping_mul(0x100000001B3);
+        let pairs = pairs_for(n, p.max_pairs, seed);
+        if p.verbose {
+            let total = n.saturating_mul(n.saturating_sub(1)) / 2;
+            eprintln!(
+                "[kdist] {} : {n} uniques, {total} pairs -> {} computed (k={}, band={}, {} threads)",
+                s.name,
+                pairs.len(),
+                p.k,
+                p.band,
+                p.threads,
+            );
+        }
+        // Parallel per-pair: kdist (cheap) + unbanded NW (the cost). Per-thread
+        // AlignBuffers reuse via map_init.
+        let rows: Vec<(f64, usize, usize, f64, bool)> = pool.install(|| {
+            pairs
+                .par_iter()
+                .map_init(AlignBuffers::new, |buf, &(i, j)| {
+                    let kd = kmer_dist8(
+                        &s.kmers[i],
+                        s.enc[i].len(),
+                        &s.kmers[j],
+                        s.enc[j].len(),
+                        p.k,
+                    );
+                    align_endsfree_with_buf(&s.enc[i], &s.enc[j], 5, -4, -8, p.band, buf);
+                    let (edits, core) = aln_divergence(&buf.al0, &buf.al1);
+                    let pct = if core > 0 {
+                        100.0 * edits as f64 / core as f64
+                    } else {
+                        0.0
+                    };
+                    (kd, edits, core, pct, kd < p.cutoff)
+                })
+                .collect()
+        });
+        for (idx, &(kd, edits, core, pct, sin)) in rows.iter().enumerate() {
+            let (i, j) = pairs[idx];
+            tot += 1;
+            if sin {
+                scr += 1;
+                if pct > p.leak_pct {
+                    leak += 1;
                 }
             }
             writeln!(
-                f,
-                "{kd:.4},{edits},{core},{pct:.3},{},{},{}",
-                scr as u8, seqs[i].1, seqs[j].1
-            )
-            .unwrap();
-            *emitted += 1;
-        };
-
-        if sample {
-            for _ in 0..max_pairs {
-                let i = rnd(n);
-                let mut j = rnd(n);
-                if i == j {
-                    j = (j + 1) % n;
-                }
-                do_pair(
-                    i.min(j),
-                    i.max(j),
-                    &mut f,
-                    &mut emitted,
-                    &mut screened_in,
-                    &mut leak,
-                );
-            }
-        } else {
-            for i in 0..n {
-                for j in (i + 1)..n {
-                    do_pair(i, j, &mut f, &mut emitted, &mut screened_in, &mut leak);
-                }
-            }
+                w,
+                "{},{kd:.4},{edits},{core},{pct:.3},{},{},{}",
+                s.name, sin as u8, s.counts[i], s.counts[j]
+            )?;
         }
+    }
+    w.flush()?;
+    if p.verbose && tot > 0 {
         eprintln!(
-            "wrote {emitted} pairs -> {out}\n  screened-in (kdist<{cutoff}): {screened_in} \
-             ({:.1}%); of those, {leak} are >{leak_pct}% divergent — too far to be an \
-             error copy (the 'leakage' / wasted-alignment cost)",
-            100.0 * screened_in as f64 / emitted as f64
+            "[kdist] {tot} pairs: screened-in (kdist<{}) {scr} ({:.1}%); of those {leak} are \
+             >{}% divergent (leakage)",
+            p.cutoff,
+            100.0 * scr as f64 / tot as f64,
+            p.leak_pct,
         );
     }
+    Ok(())
 }
