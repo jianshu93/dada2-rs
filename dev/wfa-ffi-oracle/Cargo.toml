@@ -1,0 +1,15 @@
+# Standalone oracle crate — NOT part of the dada2-rs build.
+# The empty [workspace] table makes this its own workspace root so no ancestor
+# Cargo.toml can ever pull it in. It uses C++ WFA2-lib via FFI ON PURPOSE, only
+# as a test oracle for upstream issue #102 — nothing here ships. See README.md.
+[package]
+name = "wfa-ffi-oracle"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+# TODO: add a Rust FFI binding to the *C++* WFA2-lib here (see README "Wiring").
+# Left empty so the stub in src/main.rs compiles standalone today.
