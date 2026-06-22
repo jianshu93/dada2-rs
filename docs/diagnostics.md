@@ -87,13 +87,36 @@ alignment divergence. CSV columns:
 | Column | Meaning |
 |---|---|
 | `sample` | Population label (`pool`, or the sample name under `--per-sample`). |
-| `kdist` | k-mer screen distance, `1 − Σ min(kᵢ)/(L−k+1)`. |
+| `kdist` | k-mer screen distance (see formula below). |
 | `edits` | Substitution + indel columns in the aligned core. |
 | `core_len` | Aligned-core length (terminal overhang trimmed). |
 | `pct_div` | `100 · edits / core_len` — true percent divergence. |
 | `band_req` | Minimum diagonal band that reproduces this alignment (see [band size](#band-size)). |
 | `screened_in` | `1` if `kdist < cutoff` (DADA2 would align this pair). |
 | `ab_i`, `ab_j` | The two sequence abundances. |
+
+The k-mer distance itself (the ESPRIT metric DADA2 ports) is:
+
+$$
+\text{kdist} = 1 - \frac{\sum_i \min(c^{1}_{i},\, c^{2}_{i})}{\min(L_1, L_2) - k + 1}
+$$
+
+- $c^{1}_{i}, c^{2}_{i}$ — the **count** (within-sequence multiplicity) of k-mer
+  $i$ in sequence 1 and sequence 2. The metric is **multiplicity-aware**, not
+  presence/absence: the numerator is a multiset intersection, so a k-mer
+  occurring 3× in one sequence and 2× in the other contributes
+  $\min(3, 2) = 2$ shared occurrences.
+- **numerator** — total shared k-mer occurrences between the two sequences.
+- **denominator** — total k-mer positions in the shorter sequence,
+  $\min(L_1, L_2) - k + 1$.
+
+!!! note "Two kinds of \"abundance\""
+
+    The counts $c^{1}_{i}/c^{2}_{i}$ are **within-sequence k-mer
+    multiplicities** — a property of the two sequences' composition only. They
+    are unrelated to the sequences' read abundances (the `ab_i`/`ab_j` columns),
+    which do not enter the screen distance. (The `kmer8` storage saturates a
+    per-k-mer count at 255, which no realistic amplicon reaches.)
 
 #### 2. Abundance-aware mode (`--nearest-parent`)
 
